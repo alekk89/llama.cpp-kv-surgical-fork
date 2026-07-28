@@ -7,6 +7,7 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-memory-hybrid.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
@@ -3907,6 +3908,15 @@ bool llama_memory_seq_rm(
     return mem->seq_rm(seq_id, p0, p1);
 }
 
+bool llama_memory_seq_rm_attention_only(
+        llama_memory_t mem,
+          llama_seq_id seq_id,
+             llama_pos p0,
+             llama_pos p1) {
+    auto * mem_hybrid = dynamic_cast<llama_memory_hybrid *>(mem);
+    return mem_hybrid && mem_hybrid->get_mem_attn()->seq_rm(seq_id, p0, p1);
+}
+
 void llama_memory_seq_cp(
         llama_memory_t mem,
           llama_seq_id seq_id_src,
@@ -3974,6 +3984,20 @@ llama_pos llama_memory_seq_pos_max(
     }
 
     return mem->seq_pos_max(seq_id);
+}
+
+llama_pos llama_memory_seq_pos_min_attention_only(
+        llama_memory_t mem,
+          llama_seq_id seq_id) {
+    auto * mem_hybrid = dynamic_cast<llama_memory_hybrid *>(mem);
+    return mem_hybrid ? mem_hybrid->get_mem_attn()->seq_pos_min(seq_id) : -1;
+}
+
+llama_pos llama_memory_seq_pos_max_attention_only(
+        llama_memory_t mem,
+          llama_seq_id seq_id) {
+    auto * mem_hybrid = dynamic_cast<llama_memory_hybrid *>(mem);
+    return mem_hybrid ? mem_hybrid->get_mem_attn()->seq_pos_max(seq_id) : -1;
 }
 
 bool llama_memory_can_shift(llama_memory_t mem) {
