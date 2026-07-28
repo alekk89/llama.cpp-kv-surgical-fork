@@ -2710,15 +2710,14 @@ private:
                         const auto has_spec_type = [this](common_speculative_type type) {
                             return std::find(params_base.speculative.types.begin(), params_base.speculative.types.end(), type) != params_base.speculative.types.end();
                         };
-                        const bool dflash_family_dual_edit =
-                            (has_spec_type(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) ||
-                             has_spec_type(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK)) &&
+                        const bool dflash_dual_edit =
+                            has_spec_type(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) &&
                             !has_spec_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP) &&
                             !has_spec_type(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3) &&
                             !has_spec_type(COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE);
                         // M-RoPE draft caches cannot refill an interior range while retaining a later suffix.
-                        // DFlash and DSpark inject position-local target features and can mirror the attention edit.
-                        const bool edit_draft = dual_context && (!attention_only || dflash_family_dual_edit);
+                        // DFlash injects position-local target features and can mirror the attention edit.
+                        const bool edit_draft = dual_context && (!attention_only || dflash_dual_edit);
                         if (attention_only) {
                             if (llama_memory_seq_pos_max_attention_only(mem, slot->id) < 0) {
                                 send_error(task, "Experimental attention-only KV edit requires hybrid memory", ERROR_TYPE_NOT_SUPPORTED);
