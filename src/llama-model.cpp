@@ -2716,7 +2716,10 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
 
         case LLM_ARCH_DFLASH:
             // DSV4 DSpark drafters use DeepSeek-V4's normal RoPE; legacy DFlash backbones are NeoX
-            return model->hparams.dsv4_hc_mult > 0 ? LLAMA_ROPE_TYPE_NORM : LLAMA_ROPE_TYPE_NEOX;
+            if (model->hparams.dsv4_hc_mult > 0) {
+                return LLAMA_ROPE_TYPE_NORM;
+            }
+            return model->hparams.use_mrope() ? LLAMA_ROPE_TYPE_IMROPE : LLAMA_ROPE_TYPE_NEOX;
 
         case LLM_ARCH_QWEN2VL:
         case LLM_ARCH_PADDLEOCR:

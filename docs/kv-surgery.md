@@ -7,10 +7,8 @@ This experimental fork adds a token-only managed-slot interface to
 summary or marker at the old range start, and append later conversation tokens
 without re-prefilling the retained suffix.
 
-The tested target is Qwen 3.6 27B with MTP or a DFlash sidecar. DSpark uses the
-same position-local companion-cache injection path as DFlash, but managed
-surgery with a DSpark checkpoint has not yet been model-validated. The target is
-a hybrid attention/recurrent model, so this path has a strict approximation
+The tested target is Qwen 3.6 27B with MTP or a DFlash sidecar. The target is a
+hybrid attention/recurrent model, so this path has a strict approximation
 contract:
 
 - attention-KV cells for removed tokens are released and can be reused by later
@@ -137,8 +135,8 @@ not an ordinary completion bypass: it permits only the exact router-owned
 tail, never an arbitrary replacement prompt. Speculative/MTP decoding is
 enabled only while the fork can prove that target and companion state are
 coherent. Qwen attention-only surgery remains target-only for MTP. For DFlash
-and DSpark, the same edit removes the companion positions and injects
-replacement K/V from the target features at their original positions. The edit
+the same edit removes the companion positions and injects replacement K/V from
+the target features at their original positions. The edit
 acknowledgement reports `managed_draft_coherent=true` only after both mutations
 succeed.
 
@@ -160,8 +158,6 @@ The recurrent target warnings for an interior replacement remain expected. The
 target recurrent snapshot is restored after the replacement decode; those
 warnings do not imply loss of DFlash coherence.
 
-DSpark is admitted by the same dual-edit gate because its draft context reuses
-the DFlash encoder, decoder, target-feature injection, and companion KV layout.
 If either companion removal or replacement injection fails, the slot does not
 claim draft coherence and speculative continuation remains disabled.
 
@@ -202,7 +198,7 @@ Keep all fork changes small and explicit. The current upstream touch points are:
 | --- | --- |
 | Public API and batch validation | `include/llama.h`, `src/llama-batch.cpp`, `src/llama-context.cpp` |
 | Hybrid SWA capability fix | `src/llama-kv-cache-iswa.cpp` |
-| DFlash and DSpark companion injection | `common/speculative.cpp` |
+| DFlash companion injection | `common/speculative.cpp` |
 | Managed token ledger | `tools/server/server-common.h`, `tools/server/server-common.cpp` |
 | Server task and routes | `tools/server/server-task.h`, `tools/server/server-task.cpp`, `tools/server/server-context.h`, `tools/server/server-context.cpp` |
 | Basic server coverage | `tools/server/tests/unit/test_slot_kv_edit.py` |

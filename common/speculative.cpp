@@ -920,6 +920,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     llama_batch batch;        // noise tokens
     llama_batch batch_inject; // target features for KV cache injection
 
+    bool dft_mrope = false;
+    std::vector<llama_pos> pos_mrope;
+
     std::vector<common_sampler_ptr> smpls;
 
     int32_t n_embd_dec = 0;  // draft hidden size
@@ -968,6 +971,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
         }
         mask_token_id = llama_vocab_mask(llama_model_get_vocab(model_dft));
+        dft_mrope = type == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH &&
+                (llama_model_rope_type(model_dft) == LLAMA_ROPE_TYPE_MROPE ||
+                 llama_model_rope_type(model_dft) == LLAMA_ROPE_TYPE_IMROPE);
 
         LOG_INF("%s: adding speculative implementation '%s'\n", __func__, common_speculative_type_to_str(type).c_str());
         LOG_INF("%s: - n_max=%d, n_min=%d, p_min=%.2f\n", __func__, this->params.n_max, this->params.n_min, this->params.p_min);
@@ -1120,7 +1126,20 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     batch_inject.seq_id[i][0] = seq_id;
                     batch_inject.logits[i]    = false;
                 }
+                llama_pos * pos_inject_orig = batch_inject.pos;
+                if (dft_mrope) {
+                    pos_mrope.resize((size_t) 4 * n_chunk);
+                    for (int32_t i = 0; i < n_chunk; ++i) {
+                        const llama_pos p = batch_inject.pos[i];
+                        pos_mrope[                        i] = p;
+                        pos_mrope[    (size_t) n_chunk + i] = p;
+                        pos_mrope[2 * (size_t) n_chunk + i] = p;
+                        pos_mrope[3 * (size_t) n_chunk + i] = 0;
+                    }
+                    batch_inject.pos = pos_mrope.data();
+                }
                 rc = llama_decode(ctx_dft, batch_inject);
+                batch_inject.pos = pos_inject_orig;
                 if (rc != 0) {
                     LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
                             __func__, rc, (int) n_chunk, (int) offset);
