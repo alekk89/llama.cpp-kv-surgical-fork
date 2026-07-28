@@ -985,6 +985,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         batch        = llama_batch_init(llama_n_batch(ctx_dft), 0,          n_seq);
         batch_inject = llama_batch_init(llama_n_batch(ctx_dft), n_embd_dec, n_seq);
+        batch_inject.allow_nonsequential = true;
 
         smpls.resize(n_seq);
         for (auto & s : smpls) {

@@ -217,6 +217,21 @@ struct server_slot {
 
     server_prompt prompt;
 
+    uint64_t managed_revision = 0;
+    bool managed_append_only = false;
+    // True only when every managed mutation represented by managed_revision
+    // has been applied to both the target and model-backed draft contexts.
+    // Target-only surgery is a supported fallback, but may never use MTP.
+    bool managed_draft_coherent = false;
+
+    void reset_managed_slot() {
+        if (managed_append_only) {
+            managed_append_only = false;
+            managed_draft_coherent = false;
+            managed_revision++;
+        }
+    }
+
     bool prompt_save(server_prompt_cache & prompt_cache) const {
         if (prompt.tokens.size() == 0) {
             return false;
@@ -258,6 +273,7 @@ struct server_slot {
         mem.seq_rm(id, -1, -1);
 
         prompt.clear();
+        reset_managed_slot();
     }
 
     std::vector<common_adapter_lora_info> lora;
@@ -366,7 +382,7 @@ struct server_slot {
 
     // if the context does not have a memory module then all embeddings have to be computed within a single ubatch
     // also we cannot split if the pooling would require any past tokens
-    // (MTP supports splitting — uses task->need_embd() not need_embd())
+    // MTP supports splitting and uses task->need_embd(), not need_embd().
     bool can_split() const {
         GGML_ASSERT(task);
 
@@ -404,7 +420,16 @@ struct server_slot {
     }
 
     bool can_speculate() const {
-        return !!spec;
+        // Ordinary slots are coherent through the normal speculative process
+        // hook. Managed slots require an explicit proof because target-only
+        // surgery remains legal as a conservative MTP-off fallback.
+        return !!spec && (!managed_append_only || managed_draft_coherent);
+    }
+
+    int n_context_tokens() const {
+        return managed_append_only
+            ? (int) prompt.tokens.size_live_text()
+            : prompt.n_tokens();
     }
 
     void add_token(const completion_token_output & token) {
@@ -426,7 +451,7 @@ struct server_slot {
         // determine the max draft that fits the current slot state
         // note: slot.prompt is not yet expanded with the `id` token sampled above
         //       also, need to leave space for 1 extra token to allow context shifts
-        int n_draft_max = n_ctx - prompt.n_tokens() - 2;
+        int n_draft_max = n_ctx - n_context_tokens() - 2;
 
         if (n_remaining > 0) {
             n_draft_max = std::min(n_draft_max, n_remaining - 1);
@@ -636,6 +661,9 @@ struct server_slot {
             {"n_ctx",         n_ctx},
             {"speculative",   can_speculate()},
             {"is_processing", is_processing()},
+            {"managed_revision", managed_revision},
+            {"managed_append_only", managed_append_only},
+            {"managed_draft_coherent", managed_draft_coherent},
         };
 
         const auto & ptask = task ? task : task_prev;
@@ -1548,6 +1576,9 @@ private:
                 if (slot.is_processing()) {
                     continue;
                 }
+                if ((task.type == SERVER_TASK_TYPE_COMPLETION || task.type == SERVER_TASK_TYPE_INFILL) && slot.managed_append_only && !task.slot_action.managed_native) {
+                    continue;
+                }
 
                 const auto & tokens = slot.prompt.tokens;
 
@@ -1589,6 +1620,9 @@ private:
             for (server_slot & slot : slots) {
                 // skip the slot if it is not available
                 if (slot.is_processing()) {
+                    continue;
+                }
+                if ((task.type == SERVER_TASK_TYPE_COMPLETION || task.type == SERVER_TASK_TYPE_INFILL) && slot.managed_append_only && !task.slot_action.managed_native) {
                     continue;
                 }
 
@@ -1743,7 +1777,11 @@ private:
             }
         }
 
-        if (!task.tokens.validate(ctx_tgt)) {
+        // Managed non-compacting edits use NULL placeholders for physical
+        // holes. They are never decoded again: the native continuation path
+        // proves the full cached prefix first and evaluates only its appended
+        // tail. Ordinary requests retain strict media/token validation.
+        if (!task.tokens.validate(ctx_tgt) && !task.slot_action.managed_native) {
             send_error(task, "Prompt contains invalid tokens", ERROR_TYPE_INVALID_REQUEST);
             return false;
         }
@@ -1851,7 +1889,7 @@ private:
         }
 
         // if context shifting is disabled, make sure that we don't run out of context
-        if (!params_base.ctx_shift && slot.prompt.n_tokens() + 1 >= slot.n_ctx) {
+        if (!params_base.ctx_shift && slot.n_context_tokens() + 1 >= slot.n_ctx) {
             slot.truncated      = true;
             slot.stop           = STOP_TYPE_LIMIT;
             slot.has_next_token = false;
@@ -2107,6 +2145,18 @@ private:
         res->res_type          = slot.task->params.res_type;
         res->oaicompat_model   = slot.task->params.oaicompat_model;
         res->oaicompat_cmpl_id = slot.task->params.oaicompat_cmpl_id;
+
+        if (slot.task->slot_action.managed_native) {
+            res->managed_native      = true;
+            res->n_managed_appended  = slot.task->slot_action.tokens.size();
+            const size_t managed_tail = slot.n_decoded + res->n_managed_appended;
+            res->managed_pos_start = slot.prompt.n_tokens() >= managed_tail
+                ? (llama_pos) (slot.prompt.n_tokens() - managed_tail)
+                : -1;
+            res->managed_revision    = slot.managed_revision;
+            res->managed_append_only = slot.managed_append_only;
+            res->managed_draft_coherent = slot.managed_draft_coherent;
+        }
 
         // populate res.probs_output
         if (slot.task->params.sampling.n_probs > 0) {
@@ -2372,6 +2422,11 @@ private:
                         break;
                     }
 
+                    if ((task.type == SERVER_TASK_TYPE_COMPLETION || task.type == SERVER_TASK_TYPE_INFILL) && slot->managed_append_only && !task.slot_action.managed_native) {
+                        send_error(task, "Normal completion is unavailable after KV edit; use managed append or rebuild the slot", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+
                     if (task.is_parent()) {
                         // try getting free slots for all child tasks
                         size_t n_child_tasks = task.child_tasks.size();
@@ -2541,6 +2596,8 @@ private:
                     res->n_tokens = token_count;
                     res->n_bytes  = nwrite;
                     res->t_ms     = t_save_ms;
+                    res->managed_revision = slot->managed_revision;
+                    res->managed_append_only = slot->managed_append_only;
                     queue_results.send(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_SLOT_RESTORE:
@@ -2575,6 +2632,8 @@ private:
                     tokens.resize(token_count);
                     slot->prompt.clear();
                     slot->prompt.tokens.insert(tokens);
+                    slot->managed_append_only = false;
+                    slot->managed_revision++;
 
                     const int64_t t_end = ggml_time_us();
                     const double t_restore_ms = (t_end - t_start) / 1000.0;
@@ -2587,6 +2646,8 @@ private:
                     res->n_tokens = token_count;
                     res->n_bytes  = nread;
                     res->t_ms     = t_restore_ms;
+                    res->managed_revision = slot->managed_revision;
+                    res->managed_append_only = slot->managed_append_only;
                     queue_results.send(std::move(res));
                 } break;
             case SERVER_TASK_TYPE_SLOT_ERASE:
@@ -2617,7 +2678,589 @@ private:
                     res->id       = task.id;
                     res->id_slot  = id_slot;
                     res->n_erased = n_erased;
+                    res->managed_revision = slot->managed_revision;
                     queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_SLOT_SURGERY:
+                {
+                    const int id_slot = task.slot_action.id_slot;
+                    server_slot * slot = get_slot_by_id(id_slot);
+                    if (slot == nullptr) {
+                        send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    if (slot->is_processing()) {
+                        SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
+                        queue_tasks.defer(std::move(task));
+                        break;
+                    }
+
+                    if (!task.slot_action.edits.empty()) {
+                        if (!check_slot_no_media(*slot, task.id)) {
+                            break;
+                        }
+                        if (task.slot_action.expected_revision >= 0 && (uint64_t) task.slot_action.expected_revision != slot->managed_revision) {
+                            send_error(task, "KV edit revision does not match the managed slot", ERROR_TYPE_INVALID_REQUEST);
+                            break;
+                        }
+                        const llama_memory_t mem = llama_get_memory(ctx_tgt);
+                        const llama_memory_t mem_dft = ctx_dft ? llama_get_memory(ctx_dft) : nullptr;
+                        const bool dual_context = spec && ctx_dft;
+                        const bool attention_only = task.slot_action.experimental_attention_only;
+                        const auto has_spec_type = [this](common_speculative_type type) {
+                            return std::find(params_base.speculative.types.begin(), params_base.speculative.types.end(), type) != params_base.speculative.types.end();
+                        };
+                        const bool dflash_family_dual_edit =
+                            (has_spec_type(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) ||
+                             has_spec_type(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK)) &&
+                            !has_spec_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP) &&
+                            !has_spec_type(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3) &&
+                            !has_spec_type(COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE);
+                        // M-RoPE draft caches cannot refill an interior range while retaining a later suffix.
+                        // DFlash and DSpark inject position-local target features and can mirror the attention edit.
+                        const bool edit_draft = dual_context && (!attention_only || dflash_family_dual_edit);
+                        if (attention_only) {
+                            if (llama_memory_seq_pos_max_attention_only(mem, slot->id) < 0) {
+                                send_error(task, "Experimental attention-only KV edit requires hybrid memory", ERROR_TYPE_NOT_SUPPORTED);
+                                break;
+                            }
+                            if (task.slot_action.compact_positions) {
+                                send_error(task, "Experimental attention-only KV edit does not support position compaction", ERROR_TYPE_INVALID_REQUEST);
+                                break;
+                            }
+                        } else if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_PART) {
+                            send_error(task, "KV edit requires unbounded partial sequence removal; this context only supports full or bounded rollback", ERROR_TYPE_NOT_SUPPORTED);
+                            break;
+                        }
+
+                        const llama_pos pos_min_before = attention_only ? llama_memory_seq_pos_min_attention_only(mem, slot->id) : llama_memory_seq_pos_min(mem, slot->id);
+                        const llama_pos pos_max_before = attention_only ? llama_memory_seq_pos_max_attention_only(mem, slot->id) : llama_memory_seq_pos_max(mem, slot->id);
+                        const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_tgt)));
+                        SRV_INF("KV%s edit: slot %d, positions [%d, %d], edits = %zu\n", attention_only ? " attention-only" : "", id_slot, pos_min_before, pos_max_before, task.slot_action.edits.size());
+
+                        if (pos_min_before < 0) {
+                            send_error(task, "KV edit requires a non-empty cached slot", ERROR_TYPE_INVALID_REQUEST);
+                            break;
+                        }
+                        if (task.slot_action.compact_positions && !llama_memory_can_shift(mem)) {
+                            send_error(task, "KV edit position compaction is not supported by this memory layout", ERROR_TYPE_NOT_SUPPORTED);
+                            break;
+                        }
+
+                        llama_pos last_end = pos_min_before;
+                        size_t n_removed = 0;
+                        size_t n_inserted = 0;
+                        bool valid = true;
+                        bool decoded = true;
+                        for (const auto & edit : task.slot_action.edits) {
+                            if (edit.p0 < pos_min_before || edit.p1 <= edit.p0 || edit.p1 > pos_max_before + 1 || edit.p0 < last_end || edit.tokens.size() > (size_t) (edit.p1 - edit.p0)) {
+                                valid = false;
+                                break;
+                            }
+                            for (const llama_token token : edit.tokens) {
+                                if (token < 0 || token >= n_vocab) {
+                                    valid = false;
+                                    break;
+                                }
+                            }
+                            if (!valid) {
+                                break;
+                            }
+                            last_end = edit.p1;
+                            n_removed += edit.p1 - edit.p0;
+                            n_inserted += edit.tokens.size();
+                        }
+                        if (!valid) {
+                            send_error(task, "KV edits must be ordered, non-overlapping, in cache bounds, and use valid token IDs", ERROR_TYPE_INVALID_REQUEST);
+                            break;
+                        }
+
+                        for (const auto & edit : task.slot_action.edits) {
+                            if (!(attention_only ? llama_memory_seq_rm_attention_only(mem, slot->id, edit.p0, edit.p1) : llama_memory_seq_rm(mem, slot->id, edit.p0, edit.p1))) {
+                                send_error(task, "KV edit is not supported by this memory layout", ERROR_TYPE_NOT_SUPPORTED);
+                                valid = false;
+                                break;
+                            }
+                            if (edit_draft && !llama_memory_seq_rm(mem_dft, slot->id, edit.p0, edit.p1)) {
+                                send_error(task, "Draft KV edit is not supported; target was mutated and the slot must be rebuilt", ERROR_TYPE_NOT_SUPPORTED);
+                                valid = false;
+                                break;
+                            }
+                        }
+                        if (!valid) {
+                            break;
+                        }
+                        if (dual_context && !edit_draft) {
+                            // Do not leave stale draft KV addressable after target-only surgery.
+                            llama_memory_seq_rm(mem_dft, slot->id, -1, -1);
+                        }
+
+                        llama_pos shift_before = 0;
+                        if (task.slot_action.compact_positions) {
+                            for (const auto & edit : task.slot_action.edits) {
+                                const llama_pos n_removed_edit = edit.p1 - edit.p0;
+                                const llama_pos shift = (llama_pos) edit.tokens.size() - n_removed_edit;
+                                llama_memory_seq_add(mem, slot->id, edit.p1 + shift_before, -1, shift);
+                                shift_before += shift;
+                            }
+                        }
+
+                        shift_before = 0;
+                        for (const auto & edit : task.slot_action.edits) {
+                            if (edit.tokens.empty()) {
+                                if (task.slot_action.compact_positions) {
+                                    shift_before += (llama_pos) edit.tokens.size() - (edit.p1 - edit.p0);
+                                }
+                                continue;
+                            }
+                            // llama_decode hard-asserts when its input batch
+                            // exceeds cparams.n_batch. Managed edits may
+                            // replace a large source range, so decode it in
+                            // position-preserving chunks instead of crashing
+                            // the entire primary server.
+                            const size_t n_batch = std::max<size_t>(1, llama_n_batch(ctx_tgt));
+                            for (size_t off = 0; off < edit.tokens.size(); off += n_batch) {
+                                const size_t count = std::min(n_batch, edit.tokens.size() - off);
+                                llama_batch batch = llama_batch_init(count, 0, 1);
+                                batch.n_tokens = count;
+                                batch.allow_nonsequential = true;
+                                for (size_t i = 0; i < count; ++i) {
+                                    batch.token[i] = edit.tokens[off + i];
+                                    batch.pos[i] = edit.p0 + shift_before + off + i;
+                                    batch.n_seq_id[i] = 1;
+                                    batch.seq_id[i][0] = slot->id;
+                                    batch.logits[i] = off + i + 1 == edit.tokens.size();
+                                }
+
+                                std::vector<uint8_t> recurrent_state;
+                                if (attention_only) {
+                                    const size_t size = llama_state_seq_get_size_ext(ctx_tgt, slot->id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                    recurrent_state.resize(size);
+                                    if (size == 0 || llama_state_seq_get_data_ext(ctx_tgt, recurrent_state.data(), size, slot->id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != size) {
+                                        llama_batch_free(batch);
+                                        send_error(task, "Experimental attention-only KV edit could not save recurrent state", ERROR_TYPE_SERVER);
+                                        decoded = false;
+                                        break;
+                                    }
+                                }
+                                const int ret = llama_decode(ctx_tgt, batch);
+                                const bool draft_ok = ret == 0 && (!edit_draft || common_speculative_process(spec.get(), batch));
+                                llama_batch_free(batch);
+                                if (attention_only && llama_state_seq_set_data_ext(ctx_tgt, recurrent_state.data(), recurrent_state.size(), slot->id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != recurrent_state.size()) {
+                                    send_error(task, "Experimental attention-only KV edit could not restore recurrent state", ERROR_TYPE_SERVER);
+                                    decoded = false;
+                                    break;
+                                }
+                                if (ret != 0 || !draft_ok) {
+                                    send_error(task, "Dual KV edit decode failed; the slot must be rebuilt before reuse", ERROR_TYPE_SERVER);
+                                    decoded = false;
+                                    break;
+                                }
+                            }
+                            if (!decoded) {
+                                break;
+                            }
+                            if (task.slot_action.compact_positions) {
+                                shift_before += (llama_pos) edit.tokens.size() - (edit.p1 - edit.p0);
+                            }
+                        }
+
+                        if (!decoded) {
+                            break;
+                        }
+
+                        // Preserve a position-aligned prompt ledger for the
+                        // native managed scheduler.  Non-compacting Qwen
+                        // edits leave physical holes, represented here as
+                        // NULL tokens: existing KV positions stay stable,
+                        // while sampler history reflects replacement IDs and
+                        // never pretends removed tokens are still present.
+                        if (!task.slot_action.compact_positions) {
+                            for (const auto & edit : task.slot_action.edits) {
+                                for (llama_pos pos = edit.p0; pos < edit.p1; ++pos) {
+                                    const size_t index = static_cast<size_t>(pos);
+                                    if (index >= slot->prompt.tokens.size()) {
+                                        send_error(task, "KV edit prompt ledger is shorter than its physical slot", ERROR_TYPE_SERVER);
+                                        decoded = false;
+                                        break;
+                                    }
+                                    const size_t replacement_index = static_cast<size_t>(pos - edit.p0);
+                                    slot->prompt.tokens.set_token(index,
+                                        replacement_index < edit.tokens.size()
+                                            ? edit.tokens[replacement_index]
+                                            : LLAMA_TOKEN_NULL);
+                                }
+                                if (!decoded) {
+                                    break;
+                                }
+                            }
+                            if (!decoded) {
+                                break;
+                            }
+                        }
+
+                        slot->managed_append_only = true;
+                        slot->managed_draft_coherent = edit_draft;
+                        slot->managed_revision++;
+
+                        auto res = std::make_unique<server_task_result_slot_kv_edit>();
+                        res->id             = task.id;
+                        res->id_slot        = id_slot;
+                        res->n_removed      = n_removed;
+                        res->n_inserted     = n_inserted;
+                        res->pos_min_before = pos_min_before;
+                        res->pos_max_before = pos_max_before;
+                        res->pos_min_after  = attention_only ? llama_memory_seq_pos_min_attention_only(mem, slot->id) : llama_memory_seq_pos_min(mem, slot->id);
+                        res->pos_max_after  = attention_only ? llama_memory_seq_pos_max_attention_only(mem, slot->id) : llama_memory_seq_pos_max(mem, slot->id);
+                        res->positions_compacted = task.slot_action.compact_positions;
+                        res->attention_only  = attention_only;
+                        res->managed_revision = slot->managed_revision;
+                        res->managed_append_only = slot->managed_append_only;
+                        res->managed_draft_coherent = slot->managed_draft_coherent;
+                        queue_results.send(std::move(res));
+                        break;
+                    }
+
+                    send_error(task, "KV edit requires at least one edit", ERROR_TYPE_INVALID_REQUEST);
+                } break;
+            case SERVER_TASK_TYPE_SLOT_KV_APPEND:
+                {
+                    const int id_slot = task.slot_action.id_slot;
+                    server_slot * slot = get_slot_by_id(id_slot);
+                    if (slot == nullptr) {
+                        send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    if (!check_slot_no_media(*slot, task.id)) {
+                        break;
+                    }
+                    if (slot->is_processing()) {
+                        SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
+                        queue_tasks.defer(std::move(task));
+                        break;
+                    }
+                    const bool bootstrap_prefill = task.slot_action.bootstrap_prefill;
+                    if (!slot->managed_append_only && !bootstrap_prefill) {
+                        send_error(task, "KV append requires a slot previously edited by KV surgery", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    if (bootstrap_prefill &&
+                            (slot->managed_append_only || !slot->prompt.tokens.empty())) {
+                        send_error(task, "Managed native prefill requires an empty unmanaged slot", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    if (task.slot_action.expected_revision >= 0 && (uint64_t) task.slot_action.expected_revision != slot->managed_revision) {
+                        send_error(task, "KV append revision does not match the managed slot", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+
+                    const llama_memory_t mem = llama_get_memory(ctx_tgt);
+                    const llama_pos pos_max = llama_memory_seq_pos_max(mem, slot->id);
+                    const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_tgt)));
+                    SRV_INF("KV append: slot %d, pos_max = %d, tokens = %zu\n", id_slot, pos_max, task.slot_action.tokens.size());
+                    bool valid = (bootstrap_prefill ? pos_max < 0 : pos_max >= 0) &&
+                        !task.slot_action.tokens.empty();
+                    for (const llama_token token : task.slot_action.tokens) {
+                        if (token < 0 || token >= n_vocab) {
+                            valid = false;
+                            break;
+                        }
+                    }
+                    if (!valid) {
+                        send_error(task, "KV append requires a non-empty cached slot and valid token IDs", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+
+                    // llama_decode cannot accept more tokens than the server
+                    // batch size.  The managed router can append a complete
+                    // turn, so decode it in physical batches without changing
+                    // its contiguous slot positions.
+                    const size_t n_batch = std::max<size_t>(1, llama_n_batch(ctx_tgt));
+                    bool decoded = true;
+                    for (size_t off = 0; off < task.slot_action.tokens.size(); off += n_batch) {
+                        const size_t count = std::min(n_batch, task.slot_action.tokens.size() - off);
+                        llama_batch batch = llama_batch_init(count, 0, 1);
+                        batch.n_tokens = count;
+                        for (size_t i = 0; i < count; ++i) {
+                            batch.token[i] = task.slot_action.tokens[off + i];
+                            batch.pos[i] = pos_max + 1 + off + i;
+                            batch.n_seq_id[i] = 1;
+                            batch.seq_id[i][0] = slot->id;
+                            batch.logits[i] = off + i + 1 == task.slot_action.tokens.size();
+                        }
+                        const int ret = llama_decode(ctx_tgt, batch);
+                        const bool has_draft = spec != nullptr && ctx_dft != nullptr;
+                        const bool update_draft = bootstrap_prefill || slot->managed_draft_coherent;
+                        const bool draft_ok = ret == 0 && (
+                            !update_draft || !has_draft ||
+                            common_speculative_process(spec.get(), batch)
+                        );
+                        llama_batch_free(batch);
+                        if (ret != 0 || !draft_ok) {
+                            decoded = false;
+                            break;
+                        }
+                    }
+                    if (!decoded) {
+                        send_error(task, "KV append decode failed; the slot must be rebuilt before reuse", ERROR_TYPE_SERVER);
+                        break;
+                    }
+
+                    if (bootstrap_prefill) {
+                        slot->prompt.tokens.clear();
+                        slot->prompt.tokens.insert(task.slot_action.tokens);
+                        slot->managed_append_only = true;
+                        slot->managed_draft_coherent = true;
+                    }
+                    slot->managed_revision++;
+
+                    const float * logits = llama_get_logits_ith(ctx_tgt, -1);
+                    llama_token token_probe = 0;
+                    for (llama_token token = 1; token < n_vocab; ++token) {
+                        if (logits[token] > logits[token_probe]) {
+                            token_probe = token;
+                        }
+                    }
+
+                    auto res = std::make_unique<server_task_result_slot_kv_append>();
+                    res->id          = task.id;
+                    res->id_slot     = id_slot;
+                    res->n_appended  = task.slot_action.tokens.size();
+                    res->pos_start   = pos_max + 1;
+                    res->pos_end     = pos_max + 1 + task.slot_action.tokens.size();
+                    res->token_probe = token_probe;
+                    res->managed_revision = slot->managed_revision;
+                    res->managed_append_only = slot->managed_append_only;
+                    res->managed_draft_coherent = slot->managed_draft_coherent;
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_SLOT_MANAGED_GENERATE:
+                {
+                    const int id_slot = task.slot_action.id_slot;
+                    server_slot * slot = get_slot_by_id(id_slot);
+                    if (slot == nullptr) {
+                        send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    if (!check_slot_no_media(*slot, task.id)) {
+                        break;
+                    }
+                    if (slot->is_processing()) {
+                        SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
+                        queue_tasks.defer(std::move(task));
+                        break;
+                    }
+                    // A managed router needs one token-owning lifecycle from
+                    // the first request onward.  Permit its initial decode on
+                    // an empty slot, then make the slot append-only exactly as
+                    // a KV edit would.  A populated, non-managed slot remains
+                    // rejected: mixing normal prompt-cache completion with
+                    // router-owned appends would make the revision unsafe.
+                    const bool managed_bootstrap = !slot->managed_append_only && slot->prompt.tokens.empty();
+                    if (!slot->managed_append_only && !managed_bootstrap) {
+                        send_error(task, "Managed generation requires an empty slot or a slot previously edited by KV surgery", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    if (task.slot_action.expected_revision >= 0 && (uint64_t) task.slot_action.expected_revision != slot->managed_revision) {
+                        send_error(task, "Managed generation revision does not match the managed slot", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    if (task.params.n_predict < 1 || (task.slot_action.tokens.empty() && !task.slot_action.continue_generation)) {
+                        send_error(task, "Managed generation requires append tokens (or continue_generation) and positive n_predict", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+
+                    const llama_memory_t mem = llama_get_memory(ctx_tgt);
+                    const llama_pos pos_max = llama_memory_seq_pos_max(mem, slot->id);
+                    const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_tgt)));
+                    if (pos_max < 0 && !managed_bootstrap) {
+                        send_error(task, "Managed generation requires a non-empty cached slot", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    bool valid = true;
+                    for (const llama_token token : task.slot_action.tokens) {
+                        if (token < 0 || token >= n_vocab) {
+                            valid = false;
+                            break;
+                        }
+                    }
+                    if (!valid) {
+                        send_error(task, "Managed generation append contains invalid token IDs", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+
+                    if (!task.slot_action.tokens.empty()) {
+                        const size_t n_batch = std::max<size_t>(1, llama_n_batch(ctx_tgt));
+                        bool append_decoded = true;
+                        for (size_t off = 0; off < task.slot_action.tokens.size(); off += n_batch) {
+                            const size_t count = std::min(n_batch, task.slot_action.tokens.size() - off);
+                            llama_batch append_batch = llama_batch_init(count, 0, 1);
+                            append_batch.n_tokens = count;
+                            for (size_t i = 0; i < count; ++i) {
+                                append_batch.token[i] = task.slot_action.tokens[off + i];
+                                append_batch.pos[i] = pos_max + 1 + off + i;
+                                append_batch.n_seq_id[i] = 1;
+                                append_batch.seq_id[i][0] = slot->id;
+                                append_batch.logits[i] = off + i + 1 == task.slot_action.tokens.size();
+                            }
+                            const int append_ret = llama_decode(ctx_tgt, append_batch);
+                            llama_batch_free(append_batch);
+                            if (append_ret != 0) {
+                                send_error(task, "Managed generation append decode failed; the slot must be rebuilt before reuse", ERROR_TYPE_SERVER);
+                                append_decoded = false;
+                                break;
+                            }
+                        }
+                        if (!append_decoded) {
+                            break;
+                        }
+                    }
+                    slot->prompt.tokens.insert(task.slot_action.tokens);
+
+                    common_sampler_ptr sampler(common_sampler_init(model_tgt, task.params.sampling));
+                    for (const llama_token token : task.slot_action.tokens) {
+                        common_sampler_accept(sampler.get(), token, false);
+                    }
+
+                    std::string content;
+                    llama_tokens generated;
+                    llama_pos pos_next = pos_max + 1 + task.slot_action.tokens.size();
+                    bool decoded = true;
+                    bool stopped_by_eog = false;
+                    for (int32_t i = 0; i < task.params.n_predict; ++i) {
+                        const llama_token token = common_sampler_sample(sampler.get(), ctx_tgt, -1);
+                        common_sampler_accept(sampler.get(), token, true);
+                        if (llama_vocab_is_eog(vocab, token)) {
+                            stopped_by_eog = true;
+                            break;
+                        }
+                        content += common_token_to_piece(ctx_tgt, token, params_base.special);
+                        generated.push_back(token);
+
+                        llama_batch batch = llama_batch_init(1, 0, 1);
+                        batch.n_tokens = 1;
+                        batch.token[0] = token;
+                        batch.pos[0] = pos_next++;
+                        batch.n_seq_id[0] = 1;
+                        batch.seq_id[0][0] = slot->id;
+                        batch.logits[0] = true;
+                        const int ret = llama_decode(ctx_tgt, batch);
+                        llama_batch_free(batch);
+                        if (ret != 0) {
+                            decoded = false;
+                            break;
+                        }
+                        slot->prompt.tokens.push_back(token);
+                        if (task.params.stream) {
+                            auto partial = std::make_unique<server_task_result_slot_managed_delta>();
+                            partial->id = task.id;
+                            partial->id_slot = id_slot;
+                            partial->content = common_token_to_piece(ctx_tgt, token, params_base.special);
+                            partial->token = token;
+                            partial->n_generated = generated.size();
+                            queue_results.send(std::move(partial));
+                        }
+                    }
+                    if (!decoded) {
+                        send_error(task, "Managed generation decode failed; the slot must be rebuilt before reuse", ERROR_TYPE_SERVER);
+                        break;
+                    }
+
+                    // Bootstrap is now permanently owned by the managed
+                    // append/edit protocol.  Normal completion must never
+                    // resume on this slot without an explicit rebuild.
+                    slot->managed_append_only = true;
+                    // The compatibility generator bypasses the ordinary
+                    // scheduler; do not claim draft coherence unless no
+                    // model-backed drafter exists.
+                    slot->managed_draft_coherent = spec == nullptr || ctx_dft == nullptr;
+                    slot->managed_revision++;
+                    auto res = std::make_unique<server_task_result_slot_managed_generate>();
+                    res->id = task.id;
+                    res->id_slot = id_slot;
+                    res->n_appended = task.slot_action.tokens.size();
+                    res->n_generated = generated.size();
+                    res->pos_start = pos_max + 1;
+                    res->pos_end = pos_next;
+                    res->content = std::move(content);
+                    res->tokens = std::move(generated);
+                    res->managed_revision = slot->managed_revision;
+                    res->managed_append_only = slot->managed_append_only;
+                    // Preserve OpenAI tool-call and reasoning semantics even
+                    // though this generation was driven by the managed-slot
+                    // task instead of the ordinary completion scheduler.
+                    task_result_state parser(task.params.chat_parser_params);
+                    std::vector<common_chat_msg_diff> ignored_diffs;
+                    const auto message = parser.update_chat_msg(
+                            task.slot_action.parser_prefix + res->content, false, ignored_diffs);
+                    res->oaicompat_message = message.to_json_oaicompat();
+                    res->finish_reason = stopped_by_eog
+                        ? (message.tool_calls.empty() ? "stop" : "tool_calls")
+                        : "length";
+                    queue_results.send(std::move(res));
+                } break;
+            case SERVER_TASK_TYPE_SLOT_MANAGED_NATIVE_COMPLETION:
+                {
+                    const int id_slot = task.slot_action.id_slot;
+                    server_slot * slot = get_slot_by_id(id_slot);
+                    if (slot == nullptr) {
+                        send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    if (!check_slot_no_media(*slot, task.id)) {
+                        break;
+                    }
+                    if (slot->is_processing()) {
+                        SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
+                        queue_tasks.defer(std::move(task));
+                        break;
+                    }
+                    const bool managed_bootstrap = !slot->managed_append_only && slot->prompt.tokens.empty();
+                    if (!slot->managed_append_only && !managed_bootstrap) {
+                        send_error(task, "Managed native completion requires an empty slot or a router-owned managed slot", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    if (task.slot_action.expected_revision >= 0 && (uint64_t) task.slot_action.expected_revision != slot->managed_revision) {
+                        send_error(task, "Managed native completion revision does not match the managed slot", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    if ((!task.slot_action.continue_generation && task.slot_action.tokens.empty()) ||
+                            task.params.n_predict < 1) {
+                        send_error(task, "Managed native completion requires append tokens or continuation and positive n_predict", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+
+                    // On bootstrap the ordinary scheduler fills target and
+                    // draft together through common_speculative_process. On
+                    // later turns the physical KV prefix is already resident,
+                    // any non-compacting edited ranges. Give the ordinary
+                    // completion scheduler a position-aligned virtual prompt
+                    // plus only the new tail. Its LCP path therefore evaluates
+                    // the tail, then uses the normal streaming/tool/speculative
+                    // generation machinery without a historical re-prefill.
+                    server_task completion(SERVER_TASK_TYPE_COMPLETION);
+                    completion.id      = task.id;
+                    completion.id_slot = id_slot;
+                    completion.tokens  = slot->prompt.tokens.clone();
+                    completion.tokens.insert(task.slot_action.tokens);
+                    completion.params  = std::move(task.params);
+                    completion.params.res_type = TASK_RESPONSE_TYPE_NONE;
+                    completion.slot_action.managed_native = true;
+                    completion.slot_action.continue_generation = task.slot_action.continue_generation;
+                    completion.slot_action.expected_revision = task.slot_action.expected_revision;
+                    completion.slot_action.tokens = std::move(task.slot_action.tokens);
+
+                    if (managed_bootstrap) {
+                        slot->managed_append_only = true;
+                        slot->managed_draft_coherent = spec != nullptr && ctx_dft != nullptr;
+                    }
+                    slot->managed_revision++;
+                    if (!launch_slot_with_task(*slot, std::move(completion))) {
+                        slot->managed_revision--;
+                        break;
+                    }
+                    SLT_INF(*slot, "managed native completion scheduled, append = %zu, revision = %" PRIu64 "\n",
+                            slot->task->slot_action.tokens.size(), slot->managed_revision);
                 } break;
             case SERVER_TASK_TYPE_GET_LORA:
                 {
@@ -2838,7 +3481,7 @@ private:
         // apply context-shift if needed
         // TODO: simplify and improve
         iterate(slots, [&](server_slot & slot) {
-            if (slot.state == SLOT_STATE_GENERATING && slot.prompt.n_tokens() + 1 >= slot.n_ctx) {
+            if (slot.state == SLOT_STATE_GENERATING && slot.n_context_tokens() + 1 >= slot.n_ctx) {
                 if (!params_base.ctx_shift) {
                     // this check is redundant (for good)
                     // we should never get here, because generation should already stopped in process_token()
@@ -3131,11 +3774,14 @@ private:
                                 return;
                             }
                         } else {
-                            if (slot.task->n_tokens() >= slot.n_ctx) {
+                            const int n_request_context = slot.task->slot_action.managed_native
+                                ? (int) slot.task->tokens.size_live_text()
+                                : slot.task->n_tokens();
+                            if (n_request_context >= slot.n_ctx) {
                                 send_error(slot,
                                            string_format("request (%d tokens) exceeds the available context size (%d "
                                                          "tokens), try increasing it",
-                                                         slot.task->n_tokens(), slot.n_ctx),
+                                                         n_request_context, slot.n_ctx),
                                            ERROR_TYPE_EXCEED_CONTEXT_SIZE);
                                 slot.release();
                                 return;
@@ -4490,6 +5136,21 @@ void server_routes::init_routes() {
         if (action == "erase") {
             return handle_slots_erase(req, id_slot);
         }
+        if (action == "surgery" || action == "kv_edit") {
+            return handle_slots_surgery(req, id_slot);
+        }
+        if (action == "kv_append") {
+            return handle_slots_kv_append(req, id_slot);
+        }
+        if (action == "managed_native_prefill") {
+            return handle_slots_kv_append(req, id_slot, true);
+        }
+        if (action == "managed_generate") {
+            return handle_slots_managed_generate(req, id_slot);
+        }
+        if (action == "managed_native_completion") {
+            return handle_slots_managed_native_completion(req, id_slot);
+        }
 
         res->error(format_error_response("Invalid action", ERROR_TYPE_INVALID_REQUEST));
         return res;
@@ -4537,6 +5198,22 @@ void server_routes::init_routes() {
             { "build_info",                  meta->build_info },
             { "is_sleeping",                 queue_tasks.is_sleeping() },
             { "cors_proxy_enabled",          params.ui_mcp_proxy },
+            { "managed_slot", json {
+                { "api_version", 1 },
+                { "requires_slot_save_path", true },
+                { "edit", true },
+                { "append", true },
+                { "append_generate", true },
+                { "bootstrap_generate", true },
+                { "native_completion", true },
+                { "native_bootstrap", true },
+                { "native_prefill_recovery", true },
+                { "native_continuation", true },
+                { "dual_kv_edit", true },
+                { "qwen_attention_only_dflash_dual_edit", true },
+                { "qwen_attention_only", true },
+                { "qwen_compact_positions", false },
+            } },
         };
         if (params.use_jinja) {
             if (!tmpl_tools.empty()) {
@@ -5168,6 +5845,350 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_erase(const se
 
     GGML_ASSERT(dynamic_cast<server_task_result_slot_erase*>(result.get()) != nullptr);
     res->ok(result->to_json());
+    return res;
+}
+
+// Surgical KV handler posts a task for the main loop to process
+std::unique_ptr<server_res_generator> server_routes::handle_slots_surgery(
+        const server_http_req & req, int id_slot) {
+    auto res = create_response();
+
+    const json body = json::parse(req.body);
+
+    auto & rd = res->rd;
+    {
+        server_task task(SERVER_TASK_TYPE_SLOT_SURGERY);
+        task.id = rd.get_new_id();
+        task.slot_action.id_slot = id_slot;
+        if (!body.contains("edits") || !body.at("edits").is_array() || body.at("edits").empty()) {
+            res->error(format_error_response("\"edits\" must be a non-empty array", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        for (const auto & input_edit : body.at("edits")) {
+            if (!input_edit.contains("start_pos") || !input_edit.contains("end_pos") || !input_edit.contains("tokens") || !input_edit.at("tokens").is_array()) {
+                res->error(format_error_response("Each edit requires start_pos, end_pos, and a token array", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            server_task::slot_action::edit edit;
+            edit.p0 = input_edit.at("start_pos").get<llama_pos>();
+            edit.p1 = input_edit.at("end_pos").get<llama_pos>();
+            edit.tokens = input_edit.at("tokens").get<std::vector<llama_token>>();
+            task.slot_action.edits.push_back(std::move(edit));
+        }
+        task.slot_action.compact_positions = body.value("compact_positions", false);
+        task.slot_action.experimental_attention_only = body.value("experimental_attention_only", false);
+        task.slot_action.expected_revision = body.value("expected_revision", -1LL);
+        if (task.slot_action.expected_revision < -1) {
+            res->error(format_error_response("expected_revision must be non-negative", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        rd.post_task(std::move(task));
+    }
+
+    auto result = rd.next(req.should_stop);
+    if (!result) {
+        GGML_ASSERT(req.should_stop());
+        return res;
+    }
+
+    if (result->is_error()) {
+        res->error(result->to_json());
+        return res;
+    }
+
+    GGML_ASSERT(dynamic_cast<server_task_result_slot_kv_edit*>(result.get()) != nullptr);
+    res->ok(result->to_json());
+    return res;
+}
+
+std::unique_ptr<server_res_generator> server_routes::handle_slots_kv_append(
+        const server_http_req & req, int id_slot, bool bootstrap_prefill) {
+    auto res = create_response();
+    const json body = json::parse(req.body);
+    const bool continue_generation = body.value("continue_generation", false);
+    if (!body.contains("tokens") || !body.at("tokens").is_array() || (body.at("tokens").empty() && !continue_generation)) {
+        res->error(format_error_response("\"tokens\" must be a non-empty array unless continue_generation=true", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+
+    auto & rd = res->rd;
+    {
+        server_task task(SERVER_TASK_TYPE_SLOT_KV_APPEND);
+        task.id = rd.get_new_id();
+        task.slot_action.id_slot = id_slot;
+        task.slot_action.tokens = body.at("tokens").get<std::vector<llama_token>>();
+        task.slot_action.bootstrap_prefill = bootstrap_prefill;
+        task.slot_action.continue_generation = continue_generation;
+        task.slot_action.parser_prefix = body.value("parser_prefix", "");
+        if (task.slot_action.parser_prefix.size() > 65536) {
+            res->error(format_error_response("parser_prefix is too large", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        task.slot_action.expected_revision = body.value("expected_revision", -1LL);
+        if (task.slot_action.expected_revision < -1) {
+            res->error(format_error_response("expected_revision must be non-negative", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        rd.post_task(std::move(task));
+    }
+
+    auto result = rd.next(req.should_stop);
+    if (!result) {
+        GGML_ASSERT(req.should_stop());
+        return res;
+    }
+    if (result->is_error()) {
+        res->error(result->to_json());
+        return res;
+    }
+
+    GGML_ASSERT(dynamic_cast<server_task_result_slot_kv_append*>(result.get()) != nullptr);
+    res->ok(result->to_json());
+    return res;
+}
+
+std::unique_ptr<server_res_generator> server_routes::handle_slots_managed_generate(
+        const server_http_req & req, int id_slot) {
+    auto res = create_response();
+    const json body = json::parse(req.body);
+    const bool continue_generation = body.value("continue_generation", false);
+    if (!body.contains("tokens") || !body.at("tokens").is_array() || (body.at("tokens").empty() && !continue_generation)) {
+        res->error(format_error_response("\"tokens\" must be a non-empty array unless continue_generation=true", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+    if (!body.contains("n_predict") || !body.at("n_predict").is_number_integer() || body.at("n_predict").get<int32_t>() < 1) {
+        res->error(format_error_response("\"n_predict\" must be a positive integer", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+    const bool stream = body.value("stream", false);
+
+    auto & rd = res->rd;
+    // Streaming responses use the request handle to observe client disconnects
+    // and to finalize the server-side pipe. Normal completion installs this
+    // before set_next(); managed generation must do the same.
+    if (stream) {
+        res->set_req(&req);
+    }
+    try {
+        server_task task(SERVER_TASK_TYPE_SLOT_MANAGED_GENERATE);
+        task.id = rd.get_new_id();
+        task.slot_action.id_slot = id_slot;
+        task.slot_action.tokens = body.at("tokens").get<std::vector<llama_token>>();
+        task.slot_action.continue_generation = continue_generation;
+        task.slot_action.parser_prefix = body.value("parser_prefix", "");
+        if (task.slot_action.parser_prefix.size() > 65536) {
+            res->error(format_error_response("parser_prefix is too large", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        task.slot_action.expected_revision = body.value("expected_revision", -1LL);
+        if (task.slot_action.expected_revision < -1) {
+            res->error(format_error_response("expected_revision must be non-negative", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        task.params = server_schema::eval_llama_cmpl_schema(
+                ctx_server.vocab, params, meta->slot_n_ctx, meta->logit_bias_eog, body);
+        rd.post_task(std::move(task));
+    } catch (const std::exception & e) {
+        res->error(format_error_response(e.what(), ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+
+    auto first_result = rd.next(req.should_stop);
+    if (!first_result) {
+        GGML_ASSERT(req.should_stop());
+        return res;
+    }
+    if (first_result->is_error()) {
+        res->error(first_result->to_json());
+        return res;
+    }
+
+    if (!stream) {
+        GGML_ASSERT(dynamic_cast<server_task_result_slot_managed_generate*>(first_result.get()) != nullptr);
+        res->ok(first_result->to_json());
+        return res;
+    }
+
+    GGML_ASSERT(
+        dynamic_cast<server_task_result_slot_managed_delta*>(first_result.get()) != nullptr ||
+        dynamic_cast<server_task_result_slot_managed_generate*>(first_result.get()) != nullptr
+    );
+
+    // The router consumes these endpoint-specific SSE records and translates
+    // them to its OpenAI-compatible stream.  Deltas are emitted as soon as a
+    // token has been decoded into the managed slot; the final record carries
+    // the authoritative revision and generated token ledger.
+    res->status = 200;
+    res->content_type = "text/event-stream";
+    res->data = "data: " + safe_json_to_str(first_result->to_json()) + "\n\n";
+    res->set_next([res_this = res.get()](std::string & output) -> bool {
+        try {
+            if (res_this->should_stop()) {
+                SRV_DBG("%s", "stopping managed generation stream due to should_stop condition\n");
+                return false;
+            }
+            if (!res_this->data.empty()) {
+                output = std::move(res_this->data);
+                res_this->data.clear();
+                return true;
+            }
+            if (!res_this->rd.has_next()) {
+                output = "data: [DONE]\n\n";
+                return false;
+            }
+            auto result = res_this->rd.next([res_this]() { return res_this->should_stop(); });
+            if (!result) {
+                return false;
+            }
+            if (result->is_error()) {
+                output = "data: " + safe_json_to_str(json {{ "error", result->to_json() }}) + "\n\n";
+                return false;
+            }
+            GGML_ASSERT(
+                dynamic_cast<server_task_result_slot_managed_delta*>(result.get()) != nullptr ||
+                dynamic_cast<server_task_result_slot_managed_generate*>(result.get()) != nullptr
+            );
+            output = "data: " + safe_json_to_str(result->to_json()) + "\n\n";
+            return true;
+        } catch (const std::exception & e) {
+            output = "data: " + safe_json_to_str(json {{ "error", format_error_response(e.what(), ERROR_TYPE_SERVER) }}) + "\n\n";
+            return false;
+        }
+    });
+    return res;
+}
+
+std::unique_ptr<server_res_generator> server_routes::handle_slots_managed_native_completion(
+        const server_http_req & req, int id_slot) {
+    auto res = create_response();
+    const json body = json::parse(req.body);
+    const bool continue_generation = body.value("continue_generation", false);
+    if (!body.contains("tokens") || !body.at("tokens").is_array() ||
+            (body.at("tokens").empty() && !continue_generation)) {
+        res->error(format_error_response(
+                "\"tokens\" must be non-empty unless continue_generation is true",
+                ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+    if (!body.contains("n_predict") || !body.at("n_predict").is_number_integer() || body.at("n_predict").get<int32_t>() < 1) {
+        res->error(format_error_response("\"n_predict\" must be a positive integer", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+    const bool stream = body.value("stream", false);
+
+    auto & rd = res->rd;
+    // The normal completion scheduler uses the request lifetime for streaming
+    // cancellation and pipe finalization. Keep that contract intact for the
+    // router-owned endpoint as well.
+    if (stream) {
+        res->set_req(&req);
+    }
+    try {
+        server_task task(SERVER_TASK_TYPE_SLOT_MANAGED_NATIVE_COMPLETION);
+        task.id = rd.get_new_id();
+        task.slot_action.id_slot = id_slot;
+        task.slot_action.tokens = body.at("tokens").get<std::vector<llama_token>>();
+        task.slot_action.continue_generation = continue_generation;
+        task.slot_action.expected_revision = body.value("expected_revision", -1LL);
+        if (task.slot_action.expected_revision < -1) {
+            res->error(format_error_response("expected_revision must be non-negative", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        task.params = server_schema::eval_llama_cmpl_schema(
+                ctx_server.vocab, params, meta->slot_n_ctx, meta->logit_bias_eog, body);
+        task.params.stream = stream;
+        task.params.res_type = TASK_RESPONSE_TYPE_NONE;
+        rd.post_task(std::move(task));
+    } catch (const std::exception & e) {
+        res->error(format_error_response(e.what(), ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+
+    auto first_result = rd.next(req.should_stop);
+    if (!first_result) {
+        GGML_ASSERT(req.should_stop());
+        return res;
+    }
+    if (first_result->is_error()) {
+        res->error(first_result->to_json());
+        return res;
+    }
+
+    if (!stream) {
+        GGML_ASSERT(dynamic_cast<server_task_result_cmpl_final *>(first_result.get()) != nullptr);
+        json output = first_result->to_json();
+        output["type"] = "managed_native_final";
+        res->ok(output);
+        return res;
+    }
+
+    GGML_ASSERT(
+        dynamic_cast<server_task_result_cmpl_partial *>(first_result.get()) != nullptr ||
+        dynamic_cast<server_task_result_cmpl_final *>  (first_result.get()) != nullptr
+    );
+
+    // Unlike managed_generate, this request is deliberately executed by the
+    // ordinary llama.cpp completion scheduler. We only give its generic SSE
+    // records endpoint-specific names so the router can commit the exact
+    // append/revision acknowledgement after the final token.
+    auto to_sse_record = [](server_task_result * result) {
+        json output = result->to_json();
+        if (output.is_null()) {
+            // The ordinary scheduler's first partial is only an HTTP-header
+            // flush marker. Do not mislabel it as a token delta.
+            return "data: " + safe_json_to_str(json {{ "type", "managed_native_begin" }}) + "\n\n";
+        }
+        output["type"] = dynamic_cast<server_task_result_cmpl_final *>(result) != nullptr
+            ? "managed_native_final" : "managed_native_delta";
+        return "data: " + safe_json_to_str(output) + "\n\n";
+    };
+
+    res->status = 200;
+    res->content_type = "text/event-stream";
+    res->data = to_sse_record(first_result.get());
+    auto final_sent = std::make_shared<bool>(
+        dynamic_cast<server_task_result_cmpl_final *>(first_result.get()) != nullptr);
+    res->set_next([res_this = res.get(), to_sse_record, final_sent](std::string & output) -> bool {
+        try {
+            if (res_this->should_stop()) {
+                SRV_DBG("%s", "stopping managed native completion stream due to should_stop condition\n");
+                return false;
+            }
+            if (!res_this->data.empty()) {
+                output = std::move(res_this->data);
+                res_this->data.clear();
+                return true;
+            }
+            if (*final_sent) {
+                output = "data: [DONE]\n\n";
+                return false;
+            }
+            if (!res_this->rd.has_next()) {
+                output = "data: [DONE]\n\n";
+                return false;
+            }
+            auto result = res_this->rd.next([res_this]() { return res_this->should_stop(); });
+            if (!result) {
+                return false;
+            }
+            if (result->is_error()) {
+                output = "data: " + safe_json_to_str(json {{ "error", result->to_json() }}) + "\n\n";
+                return false;
+            }
+            GGML_ASSERT(
+                dynamic_cast<server_task_result_cmpl_partial *>(result.get()) != nullptr ||
+                dynamic_cast<server_task_result_cmpl_final *>  (result.get()) != nullptr
+            );
+            output = to_sse_record(result.get());
+            if (dynamic_cast<server_task_result_cmpl_final *>(result.get()) != nullptr) {
+                *final_sent = true;
+            }
+            return true;
+        } catch (const std::exception & e) {
+            output = "data: " + safe_json_to_str(json {{ "error", format_error_response(e.what(), ERROR_TYPE_SERVER) }}) + "\n\n";
+            return false;
+        }
+    });
     return res;
 }
 

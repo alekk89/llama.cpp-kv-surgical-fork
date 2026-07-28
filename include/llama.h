@@ -261,6 +261,7 @@ extern "C" {
         int32_t      *  n_seq_id;
         llama_seq_id ** seq_id;
         int8_t       *  logits;   // TODO: rename this to "output"
+        bool             allow_nonsequential; // experimental: permit writing before the cached sequence tail
     } llama_batch;
 
     enum llama_model_kv_override_type {
@@ -737,6 +738,14 @@ extern "C" {
                  llama_pos p0,
                  llama_pos p1);
 
+    // Experimental: remove a range from the attention cache of hybrid memory only.
+    // The recurrent state is intentionally preserved and will be stale after the edit.
+    LLAMA_API bool llama_memory_seq_rm_attention_only(
+            llama_memory_t mem,
+              llama_seq_id seq_id,
+                 llama_pos p0,
+                 llama_pos p1);
+
     // Copy all tokens that belong to the specified sequence to another sequence
     // p0 < 0 : [0,  p1]
     // p1 < 0 : [p0, inf)
@@ -784,6 +793,15 @@ extern "C" {
     // Note that all positions in the range [pos_min, pos_max] are guaranteed to be present in the memory
     // Return -1 if the sequence is empty
     LLAMA_API llama_pos llama_memory_seq_pos_max(
+            llama_memory_t mem,
+              llama_seq_id seq_id);
+
+    // Experimental: returns the attention-cache range for hybrid memory, or -1.
+    LLAMA_API llama_pos llama_memory_seq_pos_min_attention_only(
+            llama_memory_t mem,
+              llama_seq_id seq_id);
+
+    LLAMA_API llama_pos llama_memory_seq_pos_max_attention_only(
             llama_memory_t mem,
               llama_seq_id seq_id);
 

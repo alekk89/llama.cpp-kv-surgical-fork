@@ -387,6 +387,14 @@ json server_task_result_cmpl_final::to_json_non_oaicompat() {
     if (!stream && !probs_output.empty()) {
         res["completion_probabilities"] = completion_token_output::probs_vector_to_json(probs_output, post_sampling_probs);
     }
+    if (managed_native) {
+        res["managed_native"] = true;
+        res["n_appended"] = n_managed_appended;
+        res["pos_start"] = managed_pos_start;
+        res["managed_revision"] = managed_revision;
+        res["managed_append_only"] = managed_append_only;
+        res["managed_draft_coherent"] = managed_draft_coherent;
+    }
     return response_fields.empty() ? res : json_get_nested_values(response_fields, res);
 }
 
@@ -1574,6 +1582,8 @@ json server_task_result_slot_save_load::to_json() {
             { "filename",  filename },
             { "n_saved",   n_tokens },
             { "n_written", n_bytes },
+            { "managed_revision", managed_revision },
+            { "managed_append_only", managed_append_only },
             { "timings", {
                 { "save_ms", t_ms }
             }},
@@ -1585,6 +1595,8 @@ json server_task_result_slot_save_load::to_json() {
         { "filename",   filename },
         { "n_restored", n_tokens },
         { "n_read",     n_bytes },
+        { "managed_revision", managed_revision },
+        { "managed_append_only", managed_append_only },
         { "timings", {
             { "restore_ms", t_ms }
         }},
@@ -1598,6 +1610,63 @@ json server_task_result_slot_erase::to_json() {
     return json {
         { "id_slot",  id_slot },
         { "n_erased", n_erased },
+        { "managed_revision", managed_revision },
+    };
+}
+
+json server_task_result_slot_kv_edit::to_json() {
+    return json {
+        { "id_slot",         id_slot },
+        { "n_removed",       n_removed },
+        { "n_inserted",      n_inserted },
+        { "pos_min_before",  pos_min_before },
+        { "pos_max_before",  pos_max_before },
+        { "pos_min_after",   pos_min_after },
+        { "pos_max_after",   pos_max_after },
+        { "positions_compacted", positions_compacted },
+        { "attention_only",  attention_only },
+        { "managed_revision", managed_revision },
+        { "managed_append_only", managed_append_only },
+        { "managed_draft_coherent", managed_draft_coherent },
+    };
+}
+
+json server_task_result_slot_kv_append::to_json() {
+    return json {
+        { "id_slot",       id_slot },
+        { "n_appended",    n_appended },
+        { "pos_start",     pos_start },
+        { "pos_end",       pos_end },
+        { "token_probe",   token_probe },
+        { "managed_revision", managed_revision },
+        { "managed_append_only", managed_append_only },
+        { "managed_draft_coherent", managed_draft_coherent },
+    };
+}
+
+json server_task_result_slot_managed_generate::to_json() {
+    return json {
+        { "id_slot", id_slot },
+        { "n_appended", n_appended },
+        { "n_generated", n_generated },
+        { "pos_start", pos_start },
+        { "pos_end", pos_end },
+        { "content", content },
+        { "tokens", tokens },
+        { "managed_revision", managed_revision },
+        { "managed_append_only", managed_append_only },
+        { "oaicompat_message", oaicompat_message },
+        { "finish_reason", finish_reason },
+    };
+}
+
+json server_task_result_slot_managed_delta::to_json() {
+    return json {
+        { "type", "managed_delta" },
+        { "id_slot", id_slot },
+        { "content", content },
+        { "token", token },
+        { "n_generated", n_generated },
     };
 }
 

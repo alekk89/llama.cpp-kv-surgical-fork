@@ -17,6 +17,20 @@ LLM inference in C/C++
 - [Changelog for `libllama` API](https://github.com/ggml-org/llama.cpp/issues/9289)
 - [Changelog for `llama-server` REST API](https://github.com/ggml-org/llama.cpp/issues/9291)
 
+## KV surgery fork
+
+This experimental fork adds a token-only managed-slot API for a
+router that replaces or removes old context without re-prefilling its suffix.
+On the tested Qwen 3.6 hybrid model it reclaims attention-KV cells and reuses
+them for later tail tokens. It is not an exact context edit: positions are not
+compacted and Qwen's recurrent state remains stale after an interior edit.
+
+The API is intentionally separate from normal OpenAI-compatible completion
+requests. Use it only through a router that owns the slot, token IDs, ranges,
+and all later appends. See [KV surgery fork guide](docs/kv-surgery.md) for the
+build command, API contract, reproducible 12K capacity test, limitations, and
+upstream-update checklist.
+
 ## Hot topics
 
 - **Hugging Face cache migration: models downloaded with `-hf` are now stored in the standard Hugging Face cache directory, enabling sharing with other HF tools.**
