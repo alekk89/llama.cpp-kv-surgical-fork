@@ -2181,8 +2181,9 @@ private:
             res->managed_native      = true;
             res->n_managed_appended  = slot.task->slot_action.tokens.size();
             const size_t managed_tail = slot.n_decoded + res->n_managed_appended;
-            res->managed_pos_start = slot.prompt.n_tokens() >= managed_tail
-                ? (llama_pos) (slot.prompt.n_tokens() - managed_tail)
+            const size_t managed_prompt_size = slot.prompt.tokens.size();
+            res->managed_pos_start = managed_prompt_size >= managed_tail
+                ? (llama_pos) (managed_prompt_size - managed_tail)
                 : -1;
             res->managed_revision    = slot.managed_revision;
             res->managed_append_only = slot.managed_append_only;
