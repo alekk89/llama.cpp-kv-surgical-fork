@@ -113,8 +113,13 @@ struct llama_memory_i {
     virtual void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) = 0;
     virtual void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) = 0;
 
+    virtual bool seq_rm_attention_only(llama_seq_id, llama_pos, llama_pos) { return false; }
+
     virtual llama_pos seq_pos_min(llama_seq_id seq_id) const = 0;
     virtual llama_pos seq_pos_max(llama_seq_id seq_id) const = 0;
+
+    virtual llama_pos seq_pos_min_attention_only(llama_seq_id) const { return -1; }
+    virtual llama_pos seq_pos_max_attention_only(llama_seq_id) const { return -1; }
 
     virtual std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const = 0;
 
