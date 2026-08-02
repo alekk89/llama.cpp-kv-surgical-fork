@@ -29,6 +29,15 @@ def request(server_url, path, payload, timeout):
         raise RuntimeError(f"{path} returned HTTP {exc.code}: {detail}") from exc
 
 
+def get_json(server_url, path, timeout=60):
+    try:
+        with urllib.request.urlopen(server_url + path, timeout=timeout) as response:
+            return json.load(response)
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"{path} returned HTTP {exc.code}: {detail}") from exc
+
+
 def tokenize(server_url, text):
     return request(server_url, "/tokenize", {"content": text}, 60)["tokens"]
 
@@ -88,18 +97,27 @@ def main():
         starts.append(len(tokenize(server_url, prefix)))
         prefix += part
 
+    slot_state = next(
+        (slot for slot in get_json(server_url, "/slots") if slot["id"] == args.slot_id),
+        None,
+    )
+    if slot_state is None:
+        raise RuntimeError(f"slot {args.slot_id} is not available")
+    if slot_state["is_processing"] or slot_state["managed_append_only"]:
+        raise RuntimeError("capacity test requires an erased, idle slot")
+
     prefill = request(
         server_url,
-        "/completion",
+        f"/slots/{args.slot_id}?action=managed_native_prefill",
         {
-            "prompt": prompt,
-            "id_slot": args.slot_id,
-            "cache_prompt": True,
-            "n_predict": 0,
-            "temperature": 0.0,
+            "expected_revision": slot_state["managed_revision"],
+            "tokens": prompt_tokens,
         },
         900,
     )
+    if prefill["managed_revision"] != slot_state["managed_revision"] + 1 or prefill["managed_requires_rebuild"]:
+        raise RuntimeError("managed prefill did not establish a healthy revision")
+    revision = prefill["managed_revision"]
 
     edits = []
     for index in range(2, args.segments + 1, 2):
@@ -118,14 +136,18 @@ def main():
         server_url,
         f"/slots/{args.slot_id}?action=kv_edit",
         {
+            "expected_revision": revision,
             "experimental_attention_only": True,
             "compact_positions": False,
             "edits": edits,
         },
         900,
     )
+    revision = edit["managed_revision"]
+    if edit["managed_requires_rebuild"]:
+        raise RuntimeError("managed edit unexpectedly requires rebuild")
     active_after_edit = (
-        prefill["tokens_evaluated"] - edit["n_removed"] + edit["n_inserted"]
+        len(prompt_tokens) - edit["n_removed"] + edit["n_inserted"]
     )
     if active_after_edit >= args.ctx_size:
         raise RuntimeError("edit did not leave capacity for new tail tokens")
@@ -142,18 +164,24 @@ def main():
         last_append = request(
             server_url,
             f"/slots/{args.slot_id}?action=kv_append",
-            {"tokens": tail_tokens[appended:appended + size]},
+            {
+                "expected_revision": revision,
+                "tokens": tail_tokens[appended:appended + size],
+            },
             900,
         )
+        revision = last_append["managed_revision"]
+        if last_append["managed_requires_rebuild"]:
+            raise RuntimeError("managed append unexpectedly requires rebuild")
         appended += size
 
     result = {
         "ctx_capacity": args.ctx_size,
-        "source_tokens": prefill["tokens_evaluated"],
+        "source_tokens": len(prompt_tokens),
         "n_removed": edit["n_removed"],
         "n_inserted": edit["n_inserted"],
         "active_after_edit": active_after_edit,
-        "physical_cells_freed": prefill["tokens_evaluated"] - active_after_edit,
+        "physical_cells_freed": len(prompt_tokens) - active_after_edit,
         "new_tail_tokens": appended,
         "estimated_active_entries": active_after_edit + appended,
         "logical_pos_end": last_append["pos_end"],
@@ -163,7 +191,7 @@ def main():
 
     if result["estimated_active_entries"] != args.ctx_size:
         raise RuntimeError("managed append did not refill the configured capacity")
-    if result["logical_pos_end"] <= prefill["tokens_evaluated"]:
+    if result["logical_pos_end"] <= len(prompt_tokens):
         raise RuntimeError("tail positions did not advance beyond the original prompt")
 
 

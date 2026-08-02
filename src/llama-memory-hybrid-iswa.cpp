@@ -174,6 +174,10 @@ void llama_memory_hybrid_iswa::seq_div(llama_seq_id seq_id, llama_pos p0, llama_
     mem_recr->seq_div(seq_id, p0, p1, d);
 }
 
+bool llama_memory_hybrid_iswa::seq_rm_attention_only(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    return mem_attn->seq_rm(seq_id, p0, p1);
+}
+
 llama_pos llama_memory_hybrid_iswa::seq_pos_min(llama_seq_id seq_id) const {
     // the min of the total cache is the max of the two caches' min values
     return std::max(mem_attn->seq_pos_min(seq_id), mem_recr->seq_pos_min(seq_id));
@@ -182,6 +186,14 @@ llama_pos llama_memory_hybrid_iswa::seq_pos_min(llama_seq_id seq_id) const {
 llama_pos llama_memory_hybrid_iswa::seq_pos_max(llama_seq_id seq_id) const {
     // the max of the total cache is the min of the two caches' max values
     return std::min(mem_attn->seq_pos_max(seq_id), mem_recr->seq_pos_max(seq_id));
+}
+
+llama_pos llama_memory_hybrid_iswa::seq_pos_min_attention_only(llama_seq_id seq_id) const {
+    return mem_attn->seq_pos_min(seq_id);
+}
+
+llama_pos llama_memory_hybrid_iswa::seq_pos_max_attention_only(llama_seq_id seq_id) const {
+    return mem_attn->seq_pos_max(seq_id);
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_iswa::memory_breakdown() const {

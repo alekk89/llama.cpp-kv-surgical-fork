@@ -1,138 +1,346 @@
-# llama.cpp
+# llama.cpp KV surgery fork
 
-![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
+> [!WARNING]
+> This is an experimental research fork. It is not production-ready and has only been tested with Qwen 3.6 27B.
 
-<div align="center">
+This repository is a focused fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp). See the upstream project for general llama.cpp documentation and normal OpenAI-compatible server usage.
 
-<b>LLM inference in C/C++</b>
+## What it does
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Release](https://img.shields.io/github/v/release/ggml-org/llama.cpp)](https://github.com/ggml-org/llama.cpp/releases)
-[![Server](https://github.com/ggml-org/llama.cpp/actions/workflows/server.yml/badge.svg)](https://github.com/ggml-org/llama.cpp/actions/workflows/server.yml)
-[![Docker](https://github.com/ggml-org/llama.cpp/actions/workflows/docker.yml/badge.svg)](https://github.com/ggml-org/llama.cpp/actions/workflows/docker.yml)
-[![Winget](https://github.com/ggml-org/llama.cpp/actions/workflows/winget.yml/badge.svg)](https://github.com/ggml-org/llama.cpp/actions/workflows/winget.yml)
+**In simple terms:** A router can delete an old chunk or replace a large old chunk with a short summary, reclaim the removed attention KV-cache cells, and keep generating without re-prefilling the retained suffix.
 
-[manifesto](https://github.com/ggml-org/llama.cpp/discussions/205) / [ggml](https://github.com/ggml-org/ggml) / [ops](https://github.com/ggml-org/llama.cpp/blob/master/docs/ops.md) / [maintainer PRs](https://github.com/ggml-org/llama.cpp/issues?q=is%3Apr%20is%3Aopen%20draft%3AFalse%20(author%3Argerganov%20OR%20author%3AKitaitiMakoto%20OR%20author%3Adanbev%20OR%20author%3Aaldehir%20OR%20author%3Amax-krasnyansky%20OR%20author%3ACISC%20OR%20author%3Aggerganov%20OR%20author%3Aam17an%20OR%20author%3Abartowski1182%20OR%20author%3Ahipudding%20OR%20author%3AServeurpersoCom%20OR%20author%3Apwilkin%20OR%20author%3Areeselevine%20OR%20author%3Angxson%20OR%20author%3Ajeffbolznv%20OR%20author%3A0cc4m%20OR%20author%3Aangt%20OR%20author%3AIMbackK%20OR%20author%3Aarthw%20OR%20author%3AJohannesGaessler%20OR%20author%3AORippler%20OR%20author%3Aruixiang63%20OR%20author%3Axctan%20OR%20author%3Aallozaur%20OR%20author%3Ayomaytk%20OR%20author%3Aaendk%20OR%20author%3Agaugarg-nv%20OR%20author%3Ataronaeo%20OR%20author%3Aforforever73%20OR%20author%3Alhez%20OR%20author%3Anetrunnereve%20OR%20author%3Afairydreaming)%20sort%3Aupdated-desc) / [compile times](https://github.com/ggml-org/llama.cpp-dev/blob/master/README-compile-times.md) / [lib llama API](https://github.com/ggml-org/llama.cpp/issues/9289) / [llama-server REST API](https://github.com/ggml-org/llama.cpp/issues/9291)
+**Technically:** The fork adds revision-checked, token-only managed-slot endpoints to `llama-server` for in-place KV range edits, appends, and continuation. Retained token positions do not move. Replacement or summary token IDs are the only tokens decoded during an edit; the retained suffix stays frozen, while later tail tokens can reuse the released attention-KV capacity.
 
-</div>
+One initial cache fill is still required. "No re-prefill" means an edit does not decode the already-cached suffix again.
 
-## KV surgery fork
+![KV surgery animation](media/kv-surgery.gif)
 
-This experimental fork adds a token-only managed-slot API for a
-router that replaces or removes old context without re-prefilling its suffix.
-On the tested Qwen 3.6 hybrid model it reclaims attention-KV cells and reuses
-them for later tail tokens. It is not an exact context edit: positions are not
-compacted and Qwen's recurrent state remains stale after an interior edit.
+## Compatibility and limitations
 
-The API is intentionally separate from normal OpenAI-compatible completion
-requests. Use it only through a router that owns the slot, token IDs, ranges,
-and all later appends. See [KV surgery fork guide](docs/kv-surgery.md) for the
-build command, API contract, reproducible 12K capacity test, limitations, and
-upstream-update checklist.
+| Component | Status |
+| --- | --- |
+| Qwen 3.6 27B | The only tested target model |
+| DFlash | Supported and tested; the companion cache is edited with the target cache |
+| DSpark | Included by the upstream base, but not currently enabled or validated for managed KV surgery |
+| MTP | Not supported after an interior KV edit |
 
-## Quick start
+On hybrid Qwen models, recurrent state is preserved rather than recomputed. Interior edits are therefore approximate, and removed content may still influence later output.
 
-A few options to get `llama.cpp` installed on your machine:
+A purpose-built router must own the slot, exact token IDs, absolute ranges, managed revision, and all later appends. The Spomin router that implements this lifecycle is still in development and will be added here soon. Until then, this experimental managed-slot API remains intentionally separate from ordinary OpenAI-compatible completion requests.
 
-- Visit https://llama.app and follow the instructions
-- Run with Docker - see our [Docker documentation](docs/docker.md)
-- Download pre-built binaries from the [releases page](https://github.com/ggml-org/llama.cpp/releases)
-- Build from source by cloning this repository - check out [our build guide](docs/build.md)
+Managed KV operations are text-only and reject any server configured with an `mmproj`. This avoids ambiguity between managed cache holes and multimodal placeholder tokens.
 
-Once installed:
+Managed slots also disable ordinary context shifting. Generation stops at the live cache limit instead of compacting router-owned absolute positions; the router must delete, summarize, or rebuild to create capacity.
+
+## Requirements
+
+- CMake and a C++ compiler supported by upstream llama.cpp.
+- A Qwen 3.6 27B GGUF model.
+- Optionally, the matching DFlash GGUF sidecar.
+- A writable slot-save directory. Managed slot actions are disabled without `--slot-save-path`.
+- Enough CPU RAM or VRAM for the selected model and KV-cache configuration.
+
+CUDA is optional. Replace `GGML_CUDA` with the backend appropriate for your machine.
+
+For Windows CUDA builds, install Visual Studio 2022 Build Tools with the C++ workload, CMake, Git, and a CUDA toolkit supported by upstream llama.cpp. On Linux, install Git, CMake, Python 3, and your compiler/backend toolchain.
+
+## Clone and build
 
 ```sh
-# Download and run a model directly from Hugging Face
-llama cli -hf ggml-org/Qwen3.5-0.8B-GGUF
-
-# Launch OpenAI-compatible API server
-llama serve -hf ggml-org/Qwen3.5-0.8B-GGUF
+git clone --branch experimental/kv-surgery-dflash https://github.com/alekk89/llama.cpp.git
+cd llama.cpp
+cmake -S . -B build -DGGML_CUDA=ON -DLLAMA_BUILD_SERVER=ON
+cmake --build build --config Release --target llama-server -j 8
 ```
 
-<table align="center">
-    <tr>
-        <td align="center" width=50%>
-            <img width="1310" height="888" alt="VLM session with `llama cli`" src="https://github.com/user-attachments/assets/88726b48-1713-48aa-a525-95a02e78afc4" />
-            <i>VLM session with <b>llama cli</b></i>
-        </td>
-        <td align="center">
-            <img width="1392" height="958" alt="Built-in web UI against `llama serve` running Qwen 3.6" src="https://github.com/user-attachments/assets/b402f972-2e32-4def-8771-8d849f08cf2e" />
-            <i>Built-in web UI against <b>llama serve</b></i>
-        </td>
-    </tr>
-<table>
+The normal binary locations are:
 
-## Description
+- Windows multi-config build: `build\bin\Release\llama-server.exe`
+- Linux or macOS single-config build: `build/bin/llama-server`
 
-The main goal of `llama.cpp` is to enable LLM (and VLM) inference with minimal setup and state-of-the-art performance on
-a wide range of hardware - locally and in the cloud.
+## Start the server
 
-- Plain C/C++ implementation without any dependencies
-- Apple silicon is a first-class citizen - optimized via ARM NEON, Accelerate and Metal frameworks
-- AVX, AVX2, AVX512 and AMX support for x86 architectures
-- RVV, ZVFH, ZFH, ZICBOP and ZIHINTPAUSE support for RISC-V architectures
-- 1.5-bit, 2-bit, 3-bit, 4-bit, 5-bit, 6-bit, and 8-bit integer quantization for faster inference and reduced memory use
-- Custom CUDA kernels for running LLMs on NVIDIA GPUs (support for AMD GPUs via HIP and Moore Threads GPUs via MUSA)
-- Vulkan and SYCL backend support
-- CPU+GPU hybrid inference to partially accelerate models larger than the total VRAM capacity
+Create a writable slot directory and start one fixed slot. The examples use a 12,288-token context because that is the validated capacity-test configuration.
 
-The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-org/ggml) library.
+### Windows PowerShell with DFlash
 
-## Supported backends
+```powershell
+New-Item -ItemType Directory -Force .\tmp\slots | Out-Null
+.\build\bin\Release\llama-server.exe `
+  -m C:\models\Qwen3.6-27B-Q8_0.gguf `
+  -md C:\models\Qwen3.6-27B-DFlash-Q8_0.gguf `
+  --spec-type draft-dflash `
+  --spec-draft-n-max 15 `
+  --ctx-size 12288 `
+  --parallel 1 `
+  --slot-save-path .\tmp\slots `
+  --slots `
+  --no-webui `
+  -fa on `
+  -ngl 999
+```
 
-| Backend | Target devices |
+### Linux or macOS without a draft sidecar
+
+```sh
+mkdir -p ./tmp/slots
+./build/bin/llama-server \
+  -m /models/Qwen3.6-27B-Q8_0.gguf \
+  --ctx-size 12288 \
+  --parallel 1 \
+  --slot-save-path ./tmp/slots/ \
+  --slots \
+  --no-webui \
+  -fa on \
+  -ngl 999
+```
+
+Adjust model paths, GPU offload, context size, cache types, and DFlash draft size for your hardware and sidecar. The draft size is clamped to the sidecar's trained block size.
+
+## Verify the fork API
+
+The server defaults to `http://127.0.0.1:8080`. These examples use `curl`; use `curl.exe` in Windows PowerShell if `curl` resolves to `Invoke-WebRequest`.
+
+```sh
+curl -sS http://127.0.0.1:8080/props
+curl -sS http://127.0.0.1:8080/slots
+```
+
+The `/props` response must contain a `managed_slot` object with `api_version: 1`, `edit: true`, `append: true`, and `native_completion: true`.
+
+Each slot reports `managed_revision`, `managed_append_only`, `managed_draft_coherent`, and `managed_requires_rebuild`. A fresh slot starts at revision `0`.
+
+Keep the server bound to localhost unless you have configured authentication and a trusted network boundary. The managed endpoints accept exact token IDs and mutate resident model state; they should not be exposed as a public API.
+
+### Endpoint reference
+
+| Endpoint | Purpose |
 | --- | --- |
-| [BLAS](docs/build.md#blas-build) | All |
-| [BLIS](docs/backend/BLIS.md) | All |
-| [CANN](docs/build.md#cann) | Ascend NPU |
-| [CUDA](docs/build.md#cuda) | Nvidia GPU |
-| [HIP](docs/build.md#hip) | AMD GPU |
-| [Hexagon [In Progress]](docs/backend/snapdragon/README.md) | Snapdragon |
-| [IBM zDNN](docs/backend/zDNN.md) | IBM Z & LinuxONE |
-| [MUSA](docs/build.md#musa) | Moore Threads GPU |
-| [Metal](docs/build.md#metal-build) | Apple Silicon |
-| [OpenCL](docs/backend/OPENCL.md) | Adreno GPU |
-| [OpenVINO [In Progress]](docs/backend/OPENVINO.md) | Intel CPUs, GPUs, and NPUs |
-| [RPC](https://github.com/ggml-org/llama.cpp/tree/master/tools/rpc) | All |
-| [SYCL](docs/backend/SYCL.md) | Intel GPU |
-| [VirtGPU](docs/backend/VirtGPU.md) | VirtGPU APIR |
-| [Vulkan](docs/build.md#vulkan) | GPU |
-| [WebGPU](docs/build.md#webgpu) | All |
-| [ZenDNN](docs/build.md#zendnn) | AMD CPU |
+| `GET /props` | Discover managed-slot capabilities and server defaults |
+| `GET /slots` | Inspect slot state and the current managed revision when `--slots` is enabled |
+| `POST /tokenize` | Convert router text to exact target-model token IDs |
+| `POST /detokenize` | Convert a token array back to text for diagnostics |
+| `POST /slots/{id}?action=managed_native_prefill` | Fill an empty slot and enter the managed lifecycle without generation |
+| `POST /slots/{id}?action=kv_edit` | Delete or replace one or more cached ranges |
+| `POST /slots/{id}?action=kv_append` | Decode router-owned tokens at the logical tail without generation |
+| `POST /slots/{id}?action=managed_native_completion` | Preferred append-and-generate path using the normal scheduler |
+| `POST /slots/{id}?action=managed_generate` | Deprecated compatibility append-and-generate path |
+| `POST /slots/{id}?action=erase` | Clear the slot before an authoritative rebuild |
 
-## Documentation
+## Managed-slot workflow
 
-#### Tools
+Set a base URL for the examples:
 
-- [cli](tools/cli/README.md)
-- [completion](tools/completion/README.md)
-- [server](tools/server/README.md)
-- [GBNF grammars](grammars/README.md)
+```sh
+BASE=http://127.0.0.1:8080
+```
 
-#### Development
+In PowerShell, use `$BASE = "http://127.0.0.1:8080"` and replace `curl` with `curl.exe`.
 
-- [How to build](docs/build.md)
-- [Running on Docker](docs/docker.md)
-- [Build on Android](docs/android.md)
-- [Multi-GPU usage](docs/multi-gpu.md)
-- [Performance troubleshooting](docs/development/token_generation_performance_tips.md)
-- [GGML tips & tricks](https://github.com/ggml-org/llama.cpp/wiki/GGML-Tips-&-Tricks)
-- [XCFramework](docs/xcframework.md)
-- [Completions](docs/completions.md)
-- [Models](docs/models.md)
+### 1. Tokenize and track the exact prompt
 
-## Contributing
+Tokenize the complete initial router prompt once and persist the returned IDs. `add_special` should normally be true only for the initial prompt.
 
-- Contributors can open PRs
-- Collaborators will be invited based on contributions
-- Maintainers can push to branches in the `llama.cpp` repo and merge PRs into the `master` branch
-- Any help with managing issues, PRs and projects is very appreciated!
-- Read the [CONTRIBUTING.md](CONTRIBUTING.md) for more information
+```sh
+curl -sS -X POST "$BASE/tokenize" \
+  -H "Content-Type: application/json" \
+  -d '{"content":"Your complete initial router prompt","add_special":true,"parse_special":true}'
+```
 
-## Acknowledgements
+The response is:
 
-- [yhirose/cpp-httplib](https://github.com/yhirose/cpp-httplib) - Single-header HTTP server, used by `llama-server` - MIT license
-- [stb-image](https://github.com/nothings/stb) - Single-header image format decoder, used by multimodal subsystem - Public domain
-- [nlohmann/json](https://github.com/nlohmann/json) - Single-header JSON library, used by various tools/examples - MIT License
-- [miniaudio.h](https://github.com/mackron/miniaudio) - Single-header audio format decoder, used by multimodal subsystem - Public domain
-- [subprocess.h](https://github.com/sheredom/subprocess.h) - Single-header process launching solution for C and C++ - Public domain
+```json
+{
+  "tokens": [151644, 8948, 198, 2610]
+}
+```
+
+Record the absolute `[start_pos, end_pos)` token range for every removable router object. `start_pos` is inclusive and `end_pos` is exclusive.
+
+### 2. Fill and claim the managed slot
+
+Use `managed_native_prefill` to decode the initial token array without generating text. Replace the illustrative IDs with the complete array returned by `/tokenize`.
+
+```sh
+curl -sS -X POST "$BASE/slots/0?action=managed_native_prefill" \
+  -H "Content-Type: application/json" \
+  -d '{"expected_revision":0,"tokens":[151644,8948,198,2610]}'
+```
+
+Persist the returned `managed_revision`. Every successful managed mutation increments it.
+
+You may instead bootstrap an empty slot with `managed_native_completion` when you want to fill the initial cache and generate in one request.
+
+### 3. Delete a cached chunk
+
+Delete a range by supplying an empty replacement token array. For Qwen, enable experimental attention-only mode and keep position compaction disabled.
+
+```sh
+curl -sS -X POST "$BASE/slots/0?action=kv_edit" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "expected_revision":1,
+    "experimental_attention_only":true,
+    "compact_positions":false,
+    "edits":[
+      {"start_pos":1176,"end_pos":1243,"tokens":[]}
+    ]
+  }'
+```
+
+This releases the attention-KV cells in `[1176, 1243)`. The retained suffix stays at its original positions and is not re-prefilled.
+
+### 4. Replace a cached chunk with a summary
+
+The router creates the summary text outside llama.cpp, then tokenizes it without adding a new BOS token:
+
+```sh
+curl -sS -X POST "$BASE/tokenize" \
+  -H "Content-Type: application/json" \
+  -d '{"content":"[summary: seg0031, archived]: short summary","add_special":false,"parse_special":true}'
+```
+
+Insert the returned summary IDs at the old range start:
+
+```sh
+curl -sS -X POST "$BASE/slots/0?action=kv_edit" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "expected_revision":2,
+    "experimental_attention_only":true,
+    "compact_positions":false,
+    "edits":[
+      {"start_pos":1650,"end_pos":1706,"tokens":[101,202,303]}
+    ]
+  }'
+```
+
+The replacement must not be longer than the removed range. Unused positions become logical holes and their attention-KV cells are free.
+
+Multiple edits may be sent in one request. They must be ordered, non-overlapping, within the cached attention range, and contain valid target-model token IDs.
+
+### 5. Append tokens without generating
+
+Use `kv_append` when the router only needs to decode new tail tokens. It returns `token_probe`, the greedy next-token probe after the append.
+
+```sh
+curl -sS -X POST "$BASE/slots/0?action=kv_append" \
+  -H "Content-Type: application/json" \
+  -d '{"expected_revision":3,"tokens":[606,707,808]}'
+```
+
+### 6. Append and continue with the normal scheduler
+
+`managed_native_completion` is the preferred post-edit generation endpoint. It uses llama.cpp's normal scheduler while longest-prefix matching the position-aligned managed ledger, so it evaluates only the new tail rather than re-prefilling retained history.
+
+```sh
+curl -sS -X POST "$BASE/slots/0?action=managed_native_completion" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "expected_revision":4,
+    "tokens":[606,707,808],
+    "n_predict":128,
+    "temperature":0.2,
+    "stream":false
+  }'
+```
+
+`n_predict` and sampling fields may be omitted to use the server defaults. Set `stream: true` for server-sent events named `managed_native_begin`, `managed_native_delta`, and `managed_native_final`, followed by `data: [DONE]`.
+
+The final response includes the appended and generated counts, generated token IDs and text, absolute managed positions, `managed_revision`, `managed_append_only`, `managed_draft_coherent`, and `managed_requires_rebuild`.
+
+### Compatibility generation endpoint
+
+`managed_generate` is the deprecated explicit managed generator. It remains available for API compatibility, requires a positive `n_predict`, and supports streaming. New routers should use `managed_native_completion` because it uses the normal completion scheduler.
+
+```sh
+curl -sS -X POST "$BASE/slots/0?action=managed_generate" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "expected_revision":4,
+    "tokens":[606,707,808],
+    "n_predict":128,
+    "temperature":0.2,
+    "stream":false
+  }'
+```
+
+### Continue generation without new input tokens
+
+For the managed generation endpoints, send an empty token array with `continue_generation: true`:
+
+```json
+{
+  "expected_revision": 5,
+  "tokens": [],
+  "continue_generation": true,
+  "n_predict": 64
+}
+```
+
+### Reset the slot
+
+Erase the slot before rebuilding it from authoritative router state:
+
+```sh
+curl -sS -X POST "$BASE/slots/0?action=erase"
+```
+
+The erase response returns the new `managed_revision`. Rebuild from the router's exact token ledger after any failed dual edit or semantic recovery request. A revision mismatch is a rejected request and does not mutate the slot.
+
+## Revision and ownership rules
+
+- Always send the last acknowledged `managed_revision` as `expected_revision`.
+- `expected_revision` is required for prefill, edit, append, and both managed generation actions.
+- Commit router state only after receiving a successful response and its new revision.
+- After any server-side mutation failure, inspect `/slots`. If `managed_requires_rebuild` is true, erase and rebuild from authoritative router state before sending another managed action.
+- Keep exact tokenizer IDs and absolute ranges. Do not reconstruct edited ranges from decoded text.
+- Keep `compact_positions: false` for Qwen 3.6.
+- After surgery, do not send an ordinary `/completion` request against the slot.
+- Do not use normal prompt-cache matching to continue an edited slot.
+- Use a router rebuild when exact deletion semantics are required.
+- Treat `managed_draft_coherent: false` as a prohibition on model-backed speculative continuation.
+- Never use managed KV actions with an `mmproj` or multimodal slot.
+- Do not treat the upstream `save` and `restore` slot actions as managed-surgery recovery. Rebuild from authoritative router state instead.
+
+## Important response fields
+
+| Field | Meaning |
+| --- | --- |
+| `managed_revision` | Monotonic concurrency guard for the router-owned slot |
+| `managed_append_only` | The slot is under the managed lifecycle and ordinary completion is rejected |
+| `managed_draft_coherent` | Target and supported draft companion mutations both succeeded |
+| `managed_requires_rebuild` | A mutation failed after touching cache state; only erase or restore may recover the slot |
+| `n_removed` / `n_inserted` | Source range size and replacement token count for `kv_edit` |
+| `pos_min_after` / `pos_max_after` | Physical attention-cache position bounds after the edit |
+| `pos_start` / `pos_end` | Absolute range used by an append or managed continuation |
+| `token_probe` | Greedy next token after `kv_append` |
+
+## Test the fork
+
+Build `llama-server` first, then run the focused unit regression:
+
+```sh
+cd tools/server/tests
+python -m pytest unit/test_slot_kv_edit.py -v
+```
+
+With a fresh Qwen server running at a 12,288-token context, run the capacity integration test:
+
+```sh
+python tools/server/tests/kv_surgery_capacity.py --server-url http://127.0.0.1:8080
+```
+
+The harness requires an erased idle slot, discovers its current revision, and fails on any rebuild-required response.
+
+The validated capacity run reduced 9,980 prefetched tokens to 5,301 live attention entries, then accepted 6,987 new tail tokens without re-decoding the retained suffix.
+
+## Safety boundary
+
+This fork performs approximate cache surgery, not exact context rewriting. Attention-KV cells are removed, but Qwen's retained recurrent state can still contain influence from deleted material. Positions are deliberately not compacted.
+
+Use proxy/rebuild behavior for exact semantics, decompression, recovery, or any model and draft combination that has not been separately validated.
+
+See the [detailed KV surgery guide](docs/kv-surgery.md) for the full API contract, validation records, router marker convention, and upstream-update checklist.
+
+The maintained branch is `experimental/kv-surgery-dflash`. Run `scripts/check-kv-surgery-upstream.ps1 -Fetch` before carrying it to a newer upstream revision, then build and repeat both the focused regression and real Qwen integration harness.

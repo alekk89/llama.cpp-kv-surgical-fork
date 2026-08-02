@@ -394,6 +394,7 @@ json server_task_result_cmpl_final::to_json_non_oaicompat() {
         res["managed_revision"] = managed_revision;
         res["managed_append_only"] = managed_append_only;
         res["managed_draft_coherent"] = managed_draft_coherent;
+        res["managed_requires_rebuild"] = managed_requires_rebuild;
     }
     return response_fields.empty() ? res : json_get_nested_values(response_fields, res);
 }
@@ -1589,6 +1590,8 @@ json server_task_result_slot_save_load::to_json() {
             { "n_written", n_bytes },
             { "managed_revision", managed_revision },
             { "managed_append_only", managed_append_only },
+            { "managed_draft_coherent", managed_draft_coherent },
+            { "managed_requires_rebuild", managed_requires_rebuild },
             { "timings", {
                 { "save_ms", t_ms }
             }},
@@ -1602,6 +1605,8 @@ json server_task_result_slot_save_load::to_json() {
         { "n_read",     n_bytes },
         { "managed_revision", managed_revision },
         { "managed_append_only", managed_append_only },
+        { "managed_draft_coherent", managed_draft_coherent },
+        { "managed_requires_rebuild", managed_requires_rebuild },
         { "timings", {
             { "restore_ms", t_ms }
         }},
@@ -1616,6 +1621,8 @@ json server_task_result_slot_erase::to_json() {
         { "id_slot",  id_slot },
         { "n_erased", n_erased },
         { "managed_revision", managed_revision },
+        { "managed_append_only", managed_append_only },
+        { "managed_requires_rebuild", managed_requires_rebuild },
     };
 }
 
@@ -1633,6 +1640,7 @@ json server_task_result_slot_kv_edit::to_json() {
         { "managed_revision", managed_revision },
         { "managed_append_only", managed_append_only },
         { "managed_draft_coherent", managed_draft_coherent },
+        { "managed_requires_rebuild", managed_requires_rebuild },
     };
 }
 
@@ -1646,6 +1654,7 @@ json server_task_result_slot_kv_append::to_json() {
         { "managed_revision", managed_revision },
         { "managed_append_only", managed_append_only },
         { "managed_draft_coherent", managed_draft_coherent },
+        { "managed_requires_rebuild", managed_requires_rebuild },
     };
 }
 
@@ -1660,6 +1669,7 @@ json server_task_result_slot_managed_generate::to_json() {
         { "tokens", tokens },
         { "managed_revision", managed_revision },
         { "managed_append_only", managed_append_only },
+        { "managed_requires_rebuild", managed_requires_rebuild },
         { "oaicompat_message", oaicompat_message },
         { "finish_reason", finish_reason },
     };

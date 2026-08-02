@@ -9,6 +9,32 @@
 #include <cstdint>
 #include <map>
 
+enum llama_decode_flag {
+    LLAMA_DECODE_FLAG_NONE                = 0,
+    LLAMA_DECODE_FLAG_ALLOW_NONSEQUENTIAL = 1 << 0,
+};
+
+LLAMA_API int32_t llama_decode_ext(
+        llama_context * ctx,
+            llama_batch batch,
+               uint32_t flags);
+
+// Remove a range from the attention cache while preserving recurrent state.
+// Returns false or -1 unless the memory exposes a distinct attention cache.
+LLAMA_API bool llama_memory_seq_rm_attention_only(
+        llama_memory_t mem,
+          llama_seq_id seq_id,
+             llama_pos p0,
+             llama_pos p1);
+
+LLAMA_API llama_pos llama_memory_seq_pos_min_attention_only(
+        llama_memory_t mem,
+          llama_seq_id seq_id);
+
+LLAMA_API llama_pos llama_memory_seq_pos_max_attention_only(
+        llama_memory_t mem,
+          llama_seq_id seq_id);
+
 // Reserve a new compute graph. It is valid until the next call to llama_graph_reserve.
 LLAMA_API struct ggml_cgraph * llama_graph_reserve(
         struct llama_context * ctx,

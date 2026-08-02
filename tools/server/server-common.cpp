@@ -404,11 +404,7 @@ void server_tokens::insert(const llama_tokens & inp_tokens) {
 }
 
 const llama_tokens & server_tokens::get_tokens() const {
-    // A server started with an mmproj marks its token container as MTMD even
-    // when this particular slot contains text only. Managed non-sequential
-    // KV refill still needs the ordinary token ledger in that case. Refuse
-    // only when returning it would actually discard indexed media chunks.
-    GGML_ASSERT(!has_mtmd || map_idx_to_media.empty());
+    GGML_ASSERT(!has_mtmd);
     return tokens;
 }
 
@@ -424,17 +420,14 @@ llama_tokens server_tokens::get_text_tokens() const {
 }
 
 size_t server_tokens::size_live_text() const {
-    GGML_ASSERT(!has_mtmd || map_idx_to_media.empty());
+    GGML_ASSERT(!has_mtmd);
     return std::count_if(tokens.begin(), tokens.end(), [](llama_token token) {
         return token != LLAMA_TOKEN_NULL;
     });
 }
 
 void server_tokens::set_token(llama_pos pos, llama_token id) {
-    // Text-only slots remain editable when the server merely has multimodal
-    // support enabled. A slot with real media mappings must use MTMD-aware
-    // mutation instead.
-    GGML_ASSERT(!has_mtmd || map_idx_to_media.empty());
+    GGML_ASSERT(!has_mtmd); // only allow this if mtmd is disabled
     tokens[pos] = id;
 }
 

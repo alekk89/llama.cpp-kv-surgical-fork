@@ -178,15 +178,11 @@ struct server_task {
         std::string filepath;
         std::vector<edit> edits;
         std::vector<llama_token> tokens;
-        // Template-owned text immediately before sampled assistant tokens.
-        // Managed generation is fed token IDs, so the ordinary completion
-        // path cannot infer this reasoning/tool parser context itself.
+        // Template text needed to initialize reasoning and tool parsing.
         std::string parser_prefix;
         bool continue_generation = false;
         bool bootstrap_prefill = false; // restore exact IDs without sampling
-        // This completion is router-owned after a KV edit. It may enter a
-        // managed append-only slot, but is otherwise scheduled like a normal
-        // completion so it retains native streaming and speculative decoding.
+        // Allow ordinary scheduling inside a router-owned slot.
         bool managed_native = false;
         int64_t expected_revision = -1;
         bool compact_positions = false;
@@ -393,15 +389,14 @@ struct server_task_result_cmpl_final : server_task_result {
     std::string        oaicompat_cmpl_id;
     common_chat_msg    oaicompat_msg; // to be populated by update()
 
-    // Present only for the managed-native completion endpoint. These fields
-    // let the external router commit its physical token ledger after the
-    // normal scheduler has completed.
+    // Managed-native fields let the router commit its physical token ledger.
     bool managed_native = false;
     size_t n_managed_appended = 0;
     llama_pos managed_pos_start = -1;
     uint64_t managed_revision = 0;
     bool managed_append_only = false;
     bool managed_draft_coherent = false;
+    bool managed_requires_rebuild = false;
 
     std::vector<common_chat_msg_diff> oaicompat_msg_diffs; // to be populated by update()
     bool is_updated = false;
@@ -588,6 +583,8 @@ struct server_task_result_slot_save_load : server_task_result {
     double t_ms;
     uint64_t managed_revision;
     bool managed_append_only;
+    bool managed_draft_coherent;
+    bool managed_requires_rebuild;
 
     virtual json to_json() override;
 };
@@ -595,6 +592,8 @@ struct server_task_result_slot_save_load : server_task_result {
 struct server_task_result_slot_erase : server_task_result {
     size_t n_erased;
     uint64_t managed_revision;
+    bool managed_append_only;
+    bool managed_requires_rebuild;
 
     virtual json to_json() override;
 };
@@ -611,6 +610,7 @@ struct server_task_result_slot_kv_edit : server_task_result {
     uint64_t managed_revision;
     bool managed_append_only;
     bool managed_draft_coherent;
+    bool managed_requires_rebuild;
 
     virtual json to_json() override;
 };
@@ -623,6 +623,7 @@ struct server_task_result_slot_kv_append : server_task_result {
     uint64_t managed_revision;
     bool managed_append_only;
     bool managed_draft_coherent;
+    bool managed_requires_rebuild;
 
     virtual json to_json() override;
 };
@@ -636,18 +637,15 @@ struct server_task_result_slot_managed_generate : server_task_result {
     std::vector<llama_token> tokens;
     uint64_t managed_revision;
     bool managed_append_only;
-    // Parsed with the same chat-template parser used by normal OpenAI chat
-    // completion.  The router needs this to preserve tool calls while it owns
-    // the KV slot after an edit.
+    bool managed_requires_rebuild;
+    // Preserve normal OpenAI-compatible tool-call and reasoning output.
     json oaicompat_message;
     std::string finish_reason;
 
     virtual json to_json() override;
 };
 
-// Incremental token emitted by the router-owned managed generation task.
-// Kept distinct from normal completion chunks because this endpoint returns
-// the exact sampled token IDs needed by the router's physical KV ledger.
+// Incremental managed token with the exact ID required by the router ledger.
 struct server_task_result_slot_managed_delta : server_task_result {
     std::string content;
     llama_token token = -1;

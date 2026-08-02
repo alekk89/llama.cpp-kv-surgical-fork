@@ -1,4 +1,5 @@
 #include "llama-context.h"
+#include "llama-ext.h"
 
 #include "ggml.h"
 #include "llama-arch.h"
@@ -7,7 +8,6 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
-#include "llama-memory-hybrid.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
@@ -1633,7 +1633,7 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
     return false; // all sequences use backend sampling
 }
 
-int llama_context::decode(const llama_batch & batch_inp) {
+int llama_context::decode(const llama_batch & batch_inp, bool allow_nonsequential) {
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
@@ -1692,7 +1692,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
     }
 
-    if (!balloc->init(batch_inp, vocab, memory.get(), n_embd, n_seq_max, output_all)) {
+    if (!balloc->init(batch_inp, vocab, memory.get(), n_embd, n_seq_max, output_all, allow_nonsequential)) {
         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
         return -1;
     }
@@ -3913,8 +3913,7 @@ bool llama_memory_seq_rm_attention_only(
           llama_seq_id seq_id,
              llama_pos p0,
              llama_pos p1) {
-    auto * mem_hybrid = dynamic_cast<llama_memory_hybrid *>(mem);
-    return mem_hybrid && mem_hybrid->get_mem_attn()->seq_rm(seq_id, p0, p1);
+    return mem && mem->seq_rm_attention_only(seq_id, p0, p1);
 }
 
 void llama_memory_seq_cp(
@@ -3989,15 +3988,13 @@ llama_pos llama_memory_seq_pos_max(
 llama_pos llama_memory_seq_pos_min_attention_only(
         llama_memory_t mem,
           llama_seq_id seq_id) {
-    auto * mem_hybrid = dynamic_cast<llama_memory_hybrid *>(mem);
-    return mem_hybrid ? mem_hybrid->get_mem_attn()->seq_pos_min(seq_id) : -1;
+    return mem ? mem->seq_pos_min_attention_only(seq_id) : -1;
 }
 
 llama_pos llama_memory_seq_pos_max_attention_only(
         llama_memory_t mem,
           llama_seq_id seq_id) {
-    auto * mem_hybrid = dynamic_cast<llama_memory_hybrid *>(mem);
-    return mem_hybrid ? mem_hybrid->get_mem_attn()->seq_pos_max(seq_id) : -1;
+    return mem ? mem->seq_pos_max_attention_only(seq_id) : -1;
 }
 
 bool llama_memory_can_shift(llama_memory_t mem) {
@@ -4142,6 +4139,24 @@ int32_t llama_decode(
         llama_context * ctx,
           llama_batch   batch) {
     const int ret = ctx->decode(batch);
+    if (ret != 0 && ret != 1) {
+        LLAMA_LOG_ERROR("%s: failed to decode, ret = %d\n", __func__, ret);
+    }
+
+    return ret;
+}
+
+int32_t llama_decode_ext(
+        llama_context * ctx,
+          llama_batch   batch,
+             uint32_t   flags) {
+    if (flags & ~LLAMA_DECODE_FLAG_ALLOW_NONSEQUENTIAL) {
+        LLAMA_LOG_ERROR("%s: unsupported flags: 0x%x\n", __func__, flags);
+        return -1;
+    }
+
+    const bool allow_nonsequential = flags & LLAMA_DECODE_FLAG_ALLOW_NONSEQUENTIAL;
+    const int ret = ctx->decode(batch, allow_nonsequential);
     if (ret != 0 && ret != 1) {
         LLAMA_LOG_ERROR("%s: failed to decode, ret = %d\n", __func__, ret);
     }

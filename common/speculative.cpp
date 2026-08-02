@@ -991,7 +991,6 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         batch        = llama_batch_init(llama_n_batch(ctx_dft), 0,          n_seq);
         batch_inject = llama_batch_init(llama_n_batch(ctx_dft), n_embd_dec, n_seq);
-        batch_inject.allow_nonsequential = true;
 
         smpls.resize(n_seq);
         for (auto & s : smpls) {
@@ -1138,7 +1137,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     }
                     batch_inject.pos = pos_mrope.data();
                 }
-                rc = llama_decode(ctx_dft, batch_inject);
+                rc = llama_decode_ext(ctx_dft, batch_inject, LLAMA_DECODE_FLAG_ALLOW_NONSEQUENTIAL);
                 batch_inject.pos = pos_inject_orig;
                 if (rc != 0) {
                     LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",

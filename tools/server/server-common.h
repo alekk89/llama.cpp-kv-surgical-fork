@@ -211,9 +211,7 @@ public:
 
     size_t size() const { return tokens.size(); }
 
-    // Number of addressable text tokens in the ledger. Managed
-    // position-preserving edits leave LLAMA_TOKEN_NULL holes behind; those
-    // positions are chronology markers, not live KV cells.
+    // Count live tokens while preserving LLAMA_TOKEN_NULL position markers.
     size_t size_live_text() const;
 
     bool empty() const { return tokens.empty(); }

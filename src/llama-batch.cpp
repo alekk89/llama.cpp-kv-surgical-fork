@@ -28,7 +28,8 @@ bool llama_batch_allocr::init(
         const llama_memory_i * memory,
         uint32_t n_embd,
         uint32_t n_seq_max,
-        bool output_all) {
+        bool output_all,
+        bool allow_nonsequential) {
     clear();
 
     batch = batch_inp;
@@ -262,7 +263,7 @@ bool llama_batch_allocr::init(
             const llama_pos p0 = memory ? memory->seq_pos_max(s) : -1;
 
             if (batch.token) {
-                if (!batch.allow_nonsequential && p0 >= 0 && p0 >= seq_pos_min(s)) {
+                if (!allow_nonsequential && p0 >= 0 && p0 >= seq_pos_min(s)) {
                     LLAMA_LOG_ERROR(
                             "%s: the tokens of sequence %d in the input batch have inconsistent sequence positions:\n"
                             " - the last position stored in the memory module of the context (i.e. the KV cache) for sequence %d is X = %d\n"
@@ -274,7 +275,7 @@ bool llama_batch_allocr::init(
                 }
             } else {
                 // embedding inputs can have overlapping positions
-                if (!batch.allow_nonsequential && p0 >= 0 && p0 > seq_pos_min(s)) {
+                if (!allow_nonsequential && p0 >= 0 && p0 > seq_pos_min(s)) {
                     LLAMA_LOG_ERROR(
                             "%s: the tokens of sequence %d in the input batch have inconsistent sequence positions:\n"
                             " - the last position stored in the memory module of the context (i.e. the KV cache) for sequence %d is X = %d\n"
@@ -294,7 +295,7 @@ bool llama_batch_allocr::init(
 
             const llama_pos p0 = memory ? memory->seq_pos_max(s) : -1;
 
-            if (!batch.allow_nonsequential && p0 >= 0) {
+            if (!allow_nonsequential && p0 >= 0) {
                 bool ok = true;
 
                 if (seq_pos_min(s) != p0 + 1) {
@@ -939,7 +940,6 @@ struct llama_batch llama_batch_get_one(
         /*n_seq_id =*/ nullptr,
         /*seq_id   =*/ nullptr,
         /*logits   =*/ nullptr,
-        /*allow_nonsequential =*/ false,
     };
 }
 

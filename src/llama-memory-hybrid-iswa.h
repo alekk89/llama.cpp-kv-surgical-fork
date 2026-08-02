@@ -65,9 +65,12 @@ public:
     void seq_keep(llama_seq_id seq_id)                                                          override;
     void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;
     void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) override;
+    bool seq_rm_attention_only(llama_seq_id seq_id, llama_pos p0, llama_pos p1) override;
 
     llama_pos seq_pos_min(llama_seq_id seq_id) const override;
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;
+    llama_pos seq_pos_min_attention_only(llama_seq_id seq_id) const override;
+    llama_pos seq_pos_max_attention_only(llama_seq_id seq_id) const override;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 
