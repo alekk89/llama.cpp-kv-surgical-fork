@@ -4005,6 +4005,21 @@ bool llama_memory_can_shift(llama_memory_t mem) {
     return mem->get_can_shift();
 }
 
+bool llama_memory_can_shift_text_only(llama_memory_t mem) {
+    return mem && mem->get_can_shift_text_only();
+}
+
+void llama_memory_seq_add_text_only(
+        llama_memory_t mem,
+          llama_seq_id seq_id,
+             llama_pos p0,
+             llama_pos p1,
+             llama_pos delta) {
+    if (mem) {
+        mem->seq_add_text_only(seq_id, p0, p1, delta);
+    }
+}
+
 // llama state API
 
 // deprecated

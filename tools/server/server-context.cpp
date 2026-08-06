@@ -2834,14 +2834,11 @@ private:
                             !has_spec_type(COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE);
                         // M-RoPE draft caches cannot refill an interior range while retaining a later suffix.
                         // DFlash injects position-local target features and can mirror the attention edit.
-                        const bool edit_draft = dual_context && (!attention_only || dflash_dual_edit);
+                        const bool compact_dflash = dual_context && task.slot_action.compact_positions && attention_only && dflash_dual_edit;
+                        const bool edit_draft = dual_context && (!task.slot_action.compact_positions || compact_dflash) && (!attention_only || dflash_dual_edit);
                         if (attention_only) {
                             if (llama_memory_seq_pos_max_attention_only(mem, slot->id) < 0) {
                                 send_error(task, "Experimental attention-only KV edit requires hybrid memory", ERROR_TYPE_NOT_SUPPORTED);
-                                break;
-                            }
-                            if (task.slot_action.compact_positions) {
-                                send_error(task, "Experimental attention-only KV edit does not support position compaction", ERROR_TYPE_INVALID_REQUEST);
                                 break;
                             }
                         } else if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_PART) {
@@ -2858,8 +2855,12 @@ private:
                             send_error(task, "KV edit requires a non-empty cached slot", ERROR_TYPE_INVALID_REQUEST);
                             break;
                         }
-                        if (task.slot_action.compact_positions && !llama_memory_can_shift(mem)) {
+                        if (task.slot_action.compact_positions && !llama_memory_can_shift_text_only(mem)) {
                             send_error(task, "KV edit position compaction is not supported by this memory layout", ERROR_TYPE_NOT_SUPPORTED);
+                            break;
+                        }
+                        if (compact_dflash && !llama_memory_can_shift_text_only(mem_dft)) {
+                            send_error(task, "DFlash KV position compaction is not supported by this memory layout", ERROR_TYPE_NOT_SUPPORTED);
                             break;
                         }
 
@@ -2869,8 +2870,11 @@ private:
                         bool valid = true;
                         bool decoded = true;
                         bool target_mutated = false;
+                        const llama_pos edit_pos_limit = task.slot_action.compact_positions
+                            ? static_cast<llama_pos>(slot->prompt.tokens.size())
+                            : pos_max_before + 1;
                         for (const auto & edit : task.slot_action.edits) {
-                            if (edit.p0 < pos_min_before || edit.p1 <= edit.p0 || edit.p1 > pos_max_before + 1 || edit.p0 < last_end || edit.tokens.size() > (size_t) (edit.p1 - edit.p0)) {
+                            if (edit.p0 < pos_min_before || edit.p1 <= edit.p0 || edit.p1 > edit_pos_limit || edit.p0 < last_end || edit.tokens.size() > (size_t) (edit.p1 - edit.p0)) {
                                 valid = false;
                                 break;
                             }
@@ -2890,6 +2894,57 @@ private:
                         if (!valid) {
                             send_error(task, "KV edits must be ordered, non-overlapping, in cache bounds, and use valid token IDs", ERROR_TYPE_INVALID_REQUEST);
                             break;
+                        }
+
+                        llama_tokens compacted_prompt_tokens;
+                        if (task.slot_action.compact_positions) {
+                            if (slot->prompt.tokens.has_media()) {
+                                send_error(task, "KV edit position compaction requires a text-only prompt ledger", ERROR_TYPE_NOT_SUPPORTED);
+                                break;
+                            }
+                            const auto & prompt_tokens = slot->prompt.tokens.get_tokens();
+                            if ((size_t) (pos_max_before + 1) > prompt_tokens.size()) {
+                                send_error(task, "KV edit prompt ledger is shorter than its physical slot", ERROR_TYPE_SERVER);
+                                break;
+                            }
+                            bool compact_ranges_are_empty = true;
+                            for (const auto & edit : task.slot_action.edits) {
+                                if (!edit.tokens.empty()) {
+                                    continue;
+                                }
+                                for (llama_pos pos = edit.p0; pos < edit.p1; ++pos) {
+                                    if (prompt_tokens[static_cast<size_t>(pos)] != LLAMA_TOKEN_NULL) {
+                                        compact_ranges_are_empty = false;
+                                        break;
+                                    }
+                                }
+                                if (!compact_ranges_are_empty) {
+                                    break;
+                                }
+                            }
+                            if (!compact_ranges_are_empty) {
+                                send_error(task, "KV hole compaction requires already-released prompt ranges", ERROR_TYPE_INVALID_REQUEST);
+                                break;
+                            }
+                            compacted_prompt_tokens.reserve(prompt_tokens.size() - n_removed + n_inserted);
+                            size_t cursor = 0;
+                            for (const auto & edit : task.slot_action.edits) {
+                                const size_t p0 = static_cast<size_t>(edit.p0);
+                                const size_t p1 = static_cast<size_t>(edit.p1);
+                                compacted_prompt_tokens.insert(
+                                    compacted_prompt_tokens.end(),
+                                    prompt_tokens.begin() + cursor,
+                                    prompt_tokens.begin() + p0);
+                                compacted_prompt_tokens.insert(
+                                    compacted_prompt_tokens.end(),
+                                    edit.tokens.begin(),
+                                    edit.tokens.end());
+                                cursor = p1;
+                            }
+                            compacted_prompt_tokens.insert(
+                                compacted_prompt_tokens.end(),
+                                prompt_tokens.begin() + cursor,
+                                prompt_tokens.end());
                         }
 
                         for (const auto & edit : task.slot_action.edits) {
@@ -2921,7 +2976,10 @@ private:
                             for (const auto & edit : task.slot_action.edits) {
                                 const llama_pos n_removed_edit = edit.p1 - edit.p0;
                                 const llama_pos shift = (llama_pos) edit.tokens.size() - n_removed_edit;
-                                llama_memory_seq_add(mem, slot->id, edit.p1 + shift_before, -1, shift);
+                                llama_memory_seq_add_text_only(mem, slot->id, edit.p1 + shift_before, -1, shift);
+                                if (compact_dflash) {
+                                    llama_memory_seq_add_text_only(mem_dft, slot->id, edit.p1 + shift_before, -1, shift);
+                                }
                                 shift_before += shift;
                             }
                         }
@@ -2987,7 +3045,10 @@ private:
                         }
 
                         // LLAMA_TOKEN_NULL entries preserve holes in the position-aligned ledger.
-                        if (!task.slot_action.compact_positions) {
+                        if (task.slot_action.compact_positions) {
+                            slot->prompt.tokens.clear();
+                            slot->prompt.tokens.insert(compacted_prompt_tokens);
+                        } else {
                             for (const auto & edit : task.slot_action.edits) {
                                 for (llama_pos pos = edit.p0; pos < edit.p1; ++pos) {
                                     const size_t index = static_cast<size_t>(pos);
@@ -5374,8 +5435,9 @@ void server_routes::init_routes() {
                 { "native_continuation", true },
                 { "dual_kv_edit", true },
                 { "qwen_attention_only_dflash_dual_edit", true },
+                { "qwen_attention_only_dflash_dual_compact", true },
                 { "qwen_attention_only", true },
-                { "qwen_compact_positions", false },
+                { "qwen_compact_positions", true },
             } },
         };
         if (params.use_jinja) {
@@ -6166,7 +6228,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_managed_genera
             return res;
         }
         task.params = server_schema::eval_llama_cmpl_schema(
-                ctx_server.vocab, params, meta->slot_n_ctx, meta->logit_bias_eog, body);
+                ctx_server.vocab, params, meta->logit_bias_eog, body);
         rd.post_task(std::move(task));
     } catch (const std::exception & e) {
         res->error(format_error_response(e.what(), ERROR_TYPE_INVALID_REQUEST));
@@ -6270,7 +6332,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_managed_native
             return res;
         }
         task.params = server_schema::eval_llama_cmpl_schema(
-                ctx_server.vocab, params, meta->slot_n_ctx, meta->logit_bias_eog, body);
+                ctx_server.vocab, params, meta->logit_bias_eog, body);
         task.params.stream = stream;
         task.params.res_type = TASK_RESPONSE_TYPE_NONE;
         rd.post_task(std::move(task));

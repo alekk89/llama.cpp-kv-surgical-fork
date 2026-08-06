@@ -140,6 +140,10 @@ bool llama_memory_hybrid_iswa::get_can_shift() const {
     return mem_attn->get_can_shift();
 }
 
+bool llama_memory_hybrid_iswa::get_can_shift_text_only() const {
+    return mem_attn->get_can_shift_text_only();
+}
+
 void llama_memory_hybrid_iswa::clear(bool data) {
     mem_attn->clear(data);
     mem_recr->clear(data);
@@ -166,6 +170,11 @@ void llama_memory_hybrid_iswa::seq_keep(llama_seq_id seq_id) {
 
 void llama_memory_hybrid_iswa::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
     mem_attn->seq_add(seq_id, p0, p1, shift);
+    mem_recr->seq_add(seq_id, p0, p1, shift);
+}
+
+void llama_memory_hybrid_iswa::seq_add_text_only(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
+    mem_attn->seq_add_text_only(seq_id, p0, p1, shift);
     mem_recr->seq_add(seq_id, p0, p1, shift);
 }
 

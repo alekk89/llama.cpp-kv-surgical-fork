@@ -48,7 +48,8 @@ The managed capability object is returned by `GET /props`. Important discovery f
   "supports_slot_save": false,
   "native_completion": true,
   "qwen_attention_only_dflash_dual_edit": true,
-  "qwen_compact_positions": false
+  "qwen_attention_only_dflash_dual_compact": true,
+  "qwen_compact_positions": true
 }
 ```
 
@@ -79,9 +80,11 @@ POST /slots/0?action=kv_edit
 }
 ```
 
-`start_pos` is inclusive and `end_pos` is exclusive. Edits must be ordered, non-overlapping, inside the current attention range, and use valid IDs. A replacement may not exceed the removed range. For Qwen, `experimental_attention_only` must be true and `compact_positions` must remain false.
+`start_pos` is inclusive and `end_pos` is exclusive. Edits must be ordered, non-overlapping, inside the current attention range, and use valid IDs. A replacement may not exceed the removed range. For Qwen, `experimental_attention_only` must be true.
 
 Empty replacement arrays delete ranges without prefill. Non-empty replacement arrays decode only the supplied marker or summary at the old range start. Later cached positions remain unchanged and are not re-prefilled. Unused positions become logical holes and their attention cells are available for reuse.
+
+After a router finishes a batch of non-compacting edits, it may close all resulting holes in one request by submitting those empty ranges again with `compact_positions: true`. Empty compacting ranges must already contain only released `LLAMA_TOKEN_NULL` positions in the managed prompt ledger. The server applies their cumulative position deltas to the retained target cache and compacts its position-aligned prompt ledger without decoding the retained suffix. The managed text-only path permits Qwen's M-RoPE cache because all rotary axes advance together for text, while the ordinary multimodal shift gate remains disabled. A coherent DFlash cache receives the same removals and shifts and remains available for managed-native continuation. Other model-backed draft caches are invalidated. This remains KV surgery: retained values and recurrent representations are not recomputed.
 
 ### Append without generation
 
@@ -214,4 +217,4 @@ For each upstream update:
 5. Run both target-only and DFlash real-model lifecycles, including a full capacity refill and managed-native generation.
 6. Record the upstream commit, model hashes, backend, context, cache types, throughput, draft acceptance, and capacity JSON.
 
-Do not enable Qwen position compaction, MTP continuation, DSpark dual editing, or multimodal managed slots as incidental conflict resolutions. Each requires a separate model-specific design and validation effort.
+Do not enable MTP continuation, DSpark dual editing, or multimodal managed slots as incidental conflict resolutions. Each requires a separate model-specific design and validation effort. Preserve the DFlash-only dual-compaction gate when carrying Qwen position compaction forward.

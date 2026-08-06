@@ -134,6 +134,11 @@ void llama_kv_cache_iswa::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p
     kv_swa ->seq_add(seq_id, p0, p1, shift);
 }
 
+void llama_kv_cache_iswa::seq_add_text_only(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
+    kv_base->seq_add_text_only(seq_id, p0, p1, shift);
+    kv_swa ->seq_add_text_only(seq_id, p0, p1, shift);
+}
+
 void llama_kv_cache_iswa::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
     kv_base->seq_div(seq_id, p0, p1, d);
     kv_swa ->seq_div(seq_id, p0, p1, d);
@@ -254,6 +259,11 @@ bool llama_kv_cache_iswa::get_can_shift() const {
     return kv_base->get_can_shift() &&
            kv_swa->get_can_shift() &&
            kv_base->get_size() == kv_swa->get_size();
+}
+
+bool llama_kv_cache_iswa::get_can_shift_text_only() const {
+    return kv_base->get_can_shift_text_only() &&
+           kv_swa->get_can_shift_text_only();
 }
 
 void llama_kv_cache_iswa::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {

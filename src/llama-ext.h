@@ -35,6 +35,17 @@ LLAMA_API llama_pos llama_memory_seq_pos_max_attention_only(
         llama_memory_t mem,
           llama_seq_id seq_id);
 
+// Text-only managed-cache shifting permits M-RoPE because every text token
+// advances all rotary axes together. It remains disabled for multimodal use.
+LLAMA_API bool llama_memory_can_shift_text_only(llama_memory_t mem);
+
+LLAMA_API void llama_memory_seq_add_text_only(
+        llama_memory_t mem,
+          llama_seq_id seq_id,
+             llama_pos p0,
+             llama_pos p1,
+             llama_pos delta);
+
 // Reserve a new compute graph. It is valid until the next call to llama_graph_reserve.
 LLAMA_API struct ggml_cgraph * llama_graph_reserve(
         struct llama_context * ctx,

@@ -99,6 +99,10 @@ struct llama_memory_i {
 
     // getters
     virtual bool get_can_shift() const = 0;
+    // Managed text-only surgery may shift an M-RoPE cache because every text
+    // token advances all rotary axes together. Multimodal callers must continue
+    // to use get_can_shift().
+    virtual bool get_can_shift_text_only() const { return get_can_shift(); }
 
     //
     // ops
@@ -111,6 +115,9 @@ struct llama_memory_i {
     virtual void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) = 0;
     virtual void seq_keep(llama_seq_id seq_id) = 0;
     virtual void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) = 0;
+    virtual void seq_add_text_only(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
+        seq_add(seq_id, p0, p1, shift);
+    }
     virtual void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) = 0;
 
     virtual bool seq_rm_attention_only(llama_seq_id, llama_pos, llama_pos) { return false; }

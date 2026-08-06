@@ -572,6 +572,24 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
     GGML_ASSERT(hparams.n_pos_per_embd() == 1 && "seq_add() is only supported for n_pos_per_embd() == 1");
 
+    seq_add_impl(seq_id, p0, p1, shift);
+}
+
+void llama_kv_cache::seq_add_text_only(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
+    // For text-only M-RoPE, build_rope_shift() applies this scalar delta to
+    // every rotary section. Managed slots reject mmproj/media inputs, so the
+    // cached spatial ext coordinates are not used.
+    if (other) {
+        return;
+    }
+
+    GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
+
+    seq_add_impl(seq_id, p0, p1, shift);
+}
+
+void llama_kv_cache::seq_add_impl(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
+
     auto & cells = v_cells[seq_to_stream[seq_id]];
     auto & head  = v_heads[seq_to_stream[seq_id]];
 
@@ -851,7 +869,9 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
     }
 
     if (do_shift) {
-        if (!get_can_shift()) {
+        // Multi-axis shifts can only reach this point through
+        // seq_add_text_only(); ordinary M-RoPE seq_add() still rejects them.
+        if (!get_can_shift_text_only()) {
             GGML_ABORT("The current KV cache / model configuration does not support K-shift");
         }
 
@@ -1169,11 +1189,15 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 }
 
 bool llama_kv_cache::get_can_shift() const {
-    // Step35 uses per-layer RoPE dims; K-shift assumes a single global n_rot.
-    if (model.arch == LLM_ARCH_STEP35) {
+    if (hparams.n_pos_per_embd() > 1) {
         return false;
     }
-    if (hparams.n_pos_per_embd() > 1) {
+    return get_can_shift_text_only();
+}
+
+bool llama_kv_cache::get_can_shift_text_only() const {
+    // Step35 uses per-layer RoPE dims; K-shift assumes a single global n_rot.
+    if (model.arch == LLM_ARCH_STEP35) {
         return false;
     }
     return true;

@@ -159,9 +159,53 @@ def test_managed_slot_capabilities():
         "native_continuation": True,
         "dual_kv_edit": True,
         "qwen_attention_only_dflash_dual_edit": True,
+        "qwen_attention_only_dflash_dual_compact": True,
         "qwen_attention_only": True,
-        "qwen_compact_positions": False,
+        "qwen_compact_positions": True,
     }
+
+
+def test_slot_kv_holes_compact_in_one_batch():
+    global server
+    server.start()
+
+    tokens = managed_prefill(
+        "One two three four five six seven eight nine ten eleven twelve thirteen fourteen."
+    )
+    assert len(tokens) > 10
+
+    removed = server.make_request("POST", "/slots/1?action=kv_edit", data={
+        "expected_revision": 1,
+        "edits": [
+            {"start_pos": 2, "end_pos": 4, "tokens": []},
+            {"start_pos": 7, "end_pos": 9, "tokens": []},
+        ],
+    })
+    assert removed.status_code == 200
+    assert removed.body["positions_compacted"] is False
+    assert removed.body["pos_max_after"] == removed.body["pos_max_before"]
+
+    compacted = server.make_request("POST", "/slots/1?action=kv_edit", data={
+        "expected_revision": 2,
+        "compact_positions": True,
+        "edits": [
+            {"start_pos": 2, "end_pos": 4, "tokens": []},
+            {"start_pos": 7, "end_pos": 9, "tokens": []},
+        ],
+    })
+    assert compacted.status_code == 200
+    assert compacted.body["positions_compacted"] is True
+    assert compacted.body["n_removed"] == 4
+    assert compacted.body["n_inserted"] == 0
+    assert compacted.body["pos_max_after"] == compacted.body["pos_max_before"] - 4
+
+    tail = tokenize(" tail")[:1]
+    appended = server.make_request("POST", "/slots/1?action=kv_append", data={
+        "expected_revision": 3,
+        "tokens": tail,
+    })
+    assert appended.status_code == 200
+    assert appended.body["pos_start"] == compacted.body["pos_max_after"] + 1
 
 
 def test_managed_native_lifecycle_and_stream_contract():
