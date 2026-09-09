@@ -176,6 +176,12 @@ The harness discovers the current slot revision, performs managed native prefill
 
 ## Validation record
 
+### Current: Qwen3.8-27B with DFlash2
+
+Spomin is running this model pair. The live integration gate integration-20260908-07 passed replacement, deletion, compaction of 236 holes, a 13-token append, and 64 generated tokens with 120 draft tokens proposed and coherent target/draft state reported. See [runtime synchronization](spomin-runtime-sync.md). The current long-workload test will add its results when complete.
+
+### Historical: Qwen 3.6 with DFlash
+
 On 2026-08-02, the hardened working tree passed the focused six-test CUDA server regression, the existing slot save/restore suite, a complete configured CMake build, and all 42 native CTest entries after fetching the repository's tiny model fixture. It also passed the following tests on two RTX 3090 GPUs:
 
 | Configuration | Result |

@@ -19,10 +19,9 @@ One initial cache fill is still required. "No re-prefill" means an edit does not
 
 | Component | Status |
 | --- | --- |
-| Qwen 3.6 27B | Managed KV surgery has been validated with this target |
-| Qwen3.8-27B | Current Spomin target; live integration covered replacement, compaction, append, and draft generation |
-| DFlash | Supported by the current base; the original managed-DFlash validation used Qwen 3.6 27B |
+| Qwen3.8-27B | Running in Spomin; live integration passed replacement, deletion, compaction, append, and coherent DFlash2 generation |
 | DFlash2 | Coordinated target/draft range edits and hole compaction preserve coherent draft continuation; tensor-split selector support included |
+| Qwen 3.6 27B + DFlash | Historical validation; measurements are retained in the technical guide |
 | DSpark | Shares the implemented dual-edit/compaction path; separate model-specific validation is required |
 | MTP | Not supported after an interior KV edit |
 
