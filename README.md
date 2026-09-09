@@ -1,7 +1,7 @@
 # llama.cpp KV surgery fork
 
 > [!WARNING]
-> This is an experimental research fork. It is not production-ready and has only been tested with Qwen 3.6 27B.
+> This is an experimental research fork. It is not production-ready. The current base includes upstream support for Qwen3.8-Flash-Next and DFlash2, but the managed KV-surgery validation recorded here is still limited to Qwen 3.6 27B.
 
 This repository is a focused fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp). See the upstream project for general llama.cpp documentation and normal OpenAI-compatible server usage.
 
@@ -19,8 +19,10 @@ One initial cache fill is still required. "No re-prefill" means an edit does not
 
 | Component | Status |
 | --- | --- |
-| Qwen 3.6 27B | The only tested target model |
-| DFlash | Supported and tested; the companion cache is edited with the target cache |
+| Qwen 3.6 27B | Managed KV surgery has been validated with this target |
+| Qwen3.8-Flash-Next | Supported by the current llama.cpp base; managed KV surgery is not yet validated here |
+| DFlash | Supported by the current base; the original managed-DFlash validation used Qwen 3.6 27B |
+| DFlash2 | Supported by the current base. During experimental attention-only surgery, the target cache is edited while the companion draft cache is retained; this path is not yet separately validated |
 | DSpark | Included by the upstream base, but not currently enabled or validated for managed KV surgery |
 | MTP | Not supported after an interior KV edit |
 
@@ -35,8 +37,8 @@ Managed slots also disable ordinary context shifting. Generation stops at the li
 ## Requirements
 
 - CMake and a C++ compiler supported by upstream llama.cpp.
-- A Qwen 3.6 27B GGUF model.
-- Optionally, the matching DFlash GGUF sidecar.
+- A supported target GGUF model. Qwen 3.6 27B is the validated managed-surgery target; Qwen3.8-Flash-Next is supported by the current base but is not yet validated for managed surgery here.
+- Optionally, a matching DFlash or DFlash2 GGUF sidecar.
 - A writable slot-save directory. Managed slot actions are disabled without `--slot-save-path`.
 - Enough CPU RAM or VRAM for the selected model and KV-cache configuration.
 
@@ -47,7 +49,7 @@ For Windows CUDA builds, install Visual Studio 2022 Build Tools with the C++ wor
 ## Clone and build
 
 ```sh
-git clone --branch experimental/kv-surgery-dflash https://github.com/alekk89/llama.cpp.git
+git clone --branch experimental/kv-surgery-dflash https://github.com/alekk89/llama.cpp-kv-surgical-fork.git
 cd llama.cpp
 cmake -S . -B build -DGGML_CUDA=ON -DLLAMA_BUILD_SERVER=ON
 cmake --build build --config Release --target llama-server -j 8
@@ -62,7 +64,7 @@ The normal binary locations are:
 
 Create a writable slot directory and start one fixed slot. The examples use a 12,288-token context because that is the validated capacity-test configuration.
 
-### Windows PowerShell with DFlash
+### Windows PowerShell with DFlash or DFlash2
 
 ```powershell
 New-Item -ItemType Directory -Force .\tmp\slots | Out-Null
@@ -95,7 +97,7 @@ mkdir -p ./tmp/slots
   -ngl 999
 ```
 
-Adjust model paths, GPU offload, context size, cache types, and DFlash draft size for your hardware and sidecar. The draft size is clamped to the sidecar's trained block size.
+Adjust model paths, GPU offload, context size, cache types, and DFlash or DFlash2 draft size for your hardware and sidecar. The draft type is detected from the sidecar metadata, and the draft size is clamped to its trained block size.
 
 ## Verify the fork API
 
@@ -295,7 +297,7 @@ The erase response returns the new `managed_revision`. Rebuild from the router's
 - Commit router state only after receiving a successful response and its new revision.
 - After any server-side mutation failure, inspect `/slots`. If `managed_requires_rebuild` is true, erase and rebuild from authoritative router state before sending another managed action.
 - Keep exact tokenizer IDs and absolute ranges. Do not reconstruct edited ranges from decoded text.
-- Keep `compact_positions: false` for Qwen 3.6.
+- Keep `compact_positions: false` for hybrid Qwen targets, including Qwen 3.6 and Qwen3.8-Flash-Next, when using the experimental attention-only path.
 - After surgery, do not send an ordinary `/completion` request against the slot.
 - Do not use normal prompt-cache matching to continue an edited slot.
 - Use a router rebuild when exact deletion semantics are required.

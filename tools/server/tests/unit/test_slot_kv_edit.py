@@ -158,8 +158,8 @@ def test_managed_slot_capabilities():
         "native_prefill_recovery": True,
         "native_continuation": True,
         "dual_kv_edit": True,
-        "qwen_attention_only_dflash_dual_edit": True,
-        "qwen_attention_only_dflash_dual_compact": True,
+        "qwen_attention_only_dflash_dual_edit": False,
+        "qwen_attention_only_dflash_dual_compact": False,
         "qwen_attention_only": True,
         "qwen_compact_positions": True,
     }

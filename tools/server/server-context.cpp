@@ -300,7 +300,7 @@ struct server_slot {
 
     uint64_t managed_revision = 0;
     bool managed_append_only = false;
-    // True when target and model-backed draft state are coherent.
+    // True when model-backed draft state remains safe for speculative use.
     bool managed_draft_coherent = false;
     // Only erase or restore can recover a partially mutated slot.
     bool managed_requires_rebuild = false;
@@ -367,6 +367,9 @@ struct server_slot {
         SLT_TRC(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
 
         mem.seq_rm(id, -1, -1);
+        if (ctx_dft != nullptr) {
+            llama_memory_seq_rm(llama_get_memory(ctx_dft), id, -1, -1);
+        }
 
         prompt.clear();
         if (reset_managed) {
@@ -2516,7 +2519,8 @@ private:
                 {
                     // release slot linked with the task id
                     for (auto & slot : slots) {
-                        if (slot.task && slot.task->id == task.id_target) {
+                        if (slot.task && slot.task->id == task.id_target &&
+                                (task.id_slot < 0 || slot.id == task.id_slot)) {
                             slot.release();
                             break;
                         }
@@ -2792,14 +2796,16 @@ private:
                         const auto has_spec_type = [this](common_speculative_type type) {
                             return std::find(params_base.speculative.types.begin(), params_base.speculative.types.end(), type) != params_base.speculative.types.end();
                         };
-                        const bool dflash_dual_edit =
+                        const bool dflash_spec =
                             has_spec_type(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) &&
                             !has_spec_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP) &&
                             !has_spec_type(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3) &&
                             !has_spec_type(COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE);
-                        // M-RoPE draft caches cannot refill an interior range while retaining a later suffix.
-                        // DFlash injects position-local target features and can mirror the attention edit.
-                        const bool compact_dflash = dual_context && task.slot_action.compact_positions && attention_only && dflash_dual_edit;
+                        // Target verification permits stale DFlash proposal features.
+                        const bool retain_dflash_draft = dual_context && attention_only &&
+                            !task.slot_action.compact_positions && dflash_spec;
+                        const bool dflash_dual_edit = false;
+                        const bool compact_dflash = false;
                         const bool edit_draft = dual_context && (!task.slot_action.compact_positions || compact_dflash) && (!attention_only || dflash_dual_edit);
                         if (attention_only) {
                             if (llama_memory_seq_pos_max_attention_only(mem, slot->id) < 0) {
@@ -2931,7 +2937,7 @@ private:
                             }
                             break;
                         }
-                        if (dual_context && !edit_draft) {
+                        if (dual_context && !edit_draft && !retain_dflash_draft) {
                             // Do not leave stale draft KV addressable after target-only surgery.
                             llama_memory_seq_rm(mem_dft, slot->id, -1, -1);
                         }
@@ -3038,7 +3044,7 @@ private:
                             }
                         }
 
-                        slot->commit_managed_slot(edit_draft);
+                        slot->commit_managed_slot(edit_draft || retain_dflash_draft);
 
                         auto res = std::make_unique<server_task_result_slot_kv_edit>();
                         res->id             = task.id;
@@ -4963,6 +4969,10 @@ struct server_res_generator : server_res_spipe {
             queue_tasks.wait_until_no_sleep();
         }
     }
+    void on_complete() override {
+        server_res_spipe::on_complete();
+        rd.stop();
+    }
     void ok(const json & response_data) {
         status = 200;
         data = safe_json_to_str(response_data);
@@ -5378,8 +5388,8 @@ static json get_res_props(const server_context_meta & meta, const common_params 
             { "native_prefill_recovery", true },
             { "native_continuation", true },
             { "dual_kv_edit", true },
-            { "qwen_attention_only_dflash_dual_edit", true },
-            { "qwen_attention_only_dflash_dual_compact", true },
+            { "qwen_attention_only_dflash_dual_edit", false },
+            { "qwen_attention_only_dflash_dual_compact", false },
             { "qwen_attention_only", true },
             { "qwen_compact_positions", true },
         } },
@@ -5545,6 +5555,9 @@ void server_routes::init_routes() {
         }
         if (action == "erase") {
             return handle_slots_erase(req, id_slot);
+        }
+        if (action == "cancel") {
+            return handle_slots_cancel(req, id_slot);
         }
         if (action == "surgery" || action == "kv_edit") {
             return handle_slots_surgery(req, id_slot);
@@ -6169,6 +6182,38 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_erase(const se
 
     GGML_ASSERT(dynamic_cast<server_task_result_slot_erase*>(result.get()) != nullptr);
     res->ok(result->to_json());
+    return res;
+}
+
+std::unique_ptr<server_res_generator> server_routes::handle_slots_cancel(
+        const server_http_req & req, int id_slot) {
+    auto res = create_response();
+    const json body = json::parse(req.body);
+    if (!body.contains("expected_task_id") || !body.at("expected_task_id").is_number_integer()) {
+        res->error(format_error_response(
+                "\"expected_task_id\" must be an integer",
+                ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+
+    const int expected_task_id = body.at("expected_task_id").get<int>();
+    if (expected_task_id < 0) {
+        res->error(format_error_response(
+                "\"expected_task_id\" must be non-negative",
+                ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+
+    server_task task(SERVER_TASK_TYPE_CANCEL);
+    task.id = queue_tasks.get_new_id();
+    task.id_target = expected_task_id;
+    task.id_slot = id_slot;
+    queue_tasks.post(std::move(task), true);
+    res->ok(json {
+        {"id_slot", id_slot},
+        {"id_task", expected_task_id},
+        {"cancel_requested", true},
+    });
     return res;
 }
 
