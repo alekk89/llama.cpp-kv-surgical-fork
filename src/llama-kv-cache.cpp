@@ -581,15 +581,29 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
 }
 
 void llama_kv_cache::seq_add_text_only(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
-    // For text-only M-RoPE, build_rope_shift() applies this scalar delta to
-    // every rotary section. Managed slots reject mmproj/media inputs, so the
-    // cached spatial ext coordinates are not used.
+    // A rigid shift applies the same delta to every rotary section. Keep the
+    // image coordinates used by the causal mask aligned with the shifted K.
     if (other) {
         return;
     }
 
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
 
+    if (has_cell_ext() && hparams.n_pos_per_embd() > 1 && shift != 0) {
+        auto & cells = v_cells[seq_to_stream[seq_id]];
+        const llama_pos begin = std::max<llama_pos>(0, p0);
+        const llama_pos end = p1 < 0 ? std::numeric_limits<llama_pos>::max() : p1;
+        for (uint32_t i = 0; i < cells.size(); ++i) {
+            if (cells.pos_in(i, begin, end) && cells.seq_has(i, seq_id)) {
+                auto ext = cells.ext_get(i);
+                if (ext.tok == LLAMA_TOKEN_NULL) {
+                    ext.x += shift;
+                    ext.y += shift;
+                    cells.ext_set(i, ext);
+                }
+            }
+        }
+    }
     seq_add_impl(seq_id, p0, p1, shift);
 }
 
@@ -883,7 +897,7 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
         LLAMA_LOG_DEBUG("%s: applying K-shift\n", __func__);
 
         // apply K-shift if needed
-        if (hparams.rope_type != LLAMA_ROPE_TYPE_NONE) {
+        if (hparams.rope_type != LLAMA_ROPE_TYPE_NONE && !layers.empty()) {
             ggml_backend_sched_reset(sched);
 
             auto * res = lctx->get_gf_res_reserve();

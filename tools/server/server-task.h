@@ -29,6 +29,7 @@ enum server_task_type {
     SERVER_TASK_TYPE_SLOT_KV_APPEND,
     SERVER_TASK_TYPE_SLOT_MANAGED_GENERATE,
     SERVER_TASK_TYPE_SLOT_MANAGED_NATIVE_COMPLETION,
+    SERVER_TASK_TYPE_SLOT_MEDIA_RETIRE,
     SERVER_TASK_TYPE_GET_LORA,
     SERVER_TASK_TYPE_SET_LORA,
 };
@@ -184,9 +185,35 @@ struct server_task {
         bool bootstrap_prefill = false; // restore exact IDs without sampling
         // Allow ordinary scheduling inside a router-owned slot.
         bool managed_native = false;
+        llama_pos managed_pos_start = -1; // captured before generation, including EOS stops
         int64_t expected_revision = -1;
         bool compact_positions = false;
         bool experimental_attention_only = false;
+        bool study_diagnostics = false;
+        int32_t rolling_headroom = 0;
+        int32_t rolling_context_limit = 0;
+        int generation_task_id = -1;
+        bool resume_generation = false;
+        // Managed vision (see docs/managed-vision.md): image-carrying append form.
+        // `prompt` is the fully rendered chat template text; `multimodal_data`
+        // holds the image bytes in order of occurrence in the prompt.
+        // Never set together with `tokens`.
+        std::string prompt;
+        std::vector<raw_buffer> multimodal_data;
+
+        // Managed vision retirement: chunks to retire by acknowledged handle,
+        // with the expected ledger ranges (validated before any mutation).
+        struct retired_media {
+            uint64_t media_chunk_id;
+            llama_pos token_start;
+            llama_pos token_end;
+            llama_pos position_start;
+            llama_pos position_end;
+        };
+        std::vector<retired_media> media_retire;
+        // Optional token IDs installed at the earliest released interval when
+        // they fit (tombstone summary).
+        std::vector<llama_token> tombstone;
     };
     slot_action slot_action;
 
@@ -316,6 +343,13 @@ struct server_task_result {
 
 // using shared_ptr for polymorphism of server_task_result
 using server_task_result_ptr = std::unique_ptr<server_task_result>;
+
+// A generation remains owned and open while the router performs one KV edit.
+struct server_task_result_managed_pause : server_task_result {
+    json data;
+    bool is_stop() override { return false; }
+    json to_json() override { return data; }
+};
 
 struct completion_token_output {
     llama_token tok;
@@ -573,6 +607,8 @@ struct server_task_result_slot_erase : server_task_result {
 };
 
 struct server_task_result_slot_kv_edit : server_task_result {
+    json media = json::array();
+    json study_diagnostics;
     size_t n_removed;
     size_t n_inserted;
     llama_pos pos_min_before;
@@ -598,6 +634,30 @@ struct server_task_result_slot_kv_append : server_task_result {
     bool managed_append_only;
     bool managed_draft_coherent;
     bool managed_requires_rebuild;
+    // Managed vision acknowledgement (docs/managed-vision.md).
+    // Populated only for image-carrying requests; `tokens` echoes the appended
+    // stream with null at media cells, `media` one entry per media chunk.
+    json media = json::array();
+    json tokens = json();
+
+    virtual json to_json() override;
+};
+
+struct server_task_result_slot_media_retire : server_task_result {
+    size_t removed_kv_cells;
+    size_t removed_positions;
+    size_t shifted_text_cells;
+    bool positions_compacted;
+    bool tombstone_fits;
+    int64_t tombstone_token_start;
+    int64_t tombstone_position_start;
+    uint64_t managed_revision;
+    bool managed_append_only;
+    bool managed_draft_coherent;
+    bool managed_requires_rebuild;
+    // Every live chunk after the operation (updated ranges) plus one
+    // "retired: true" entry per requested chunk.
+    json media = json::array();
 
     virtual json to_json() override;
 };

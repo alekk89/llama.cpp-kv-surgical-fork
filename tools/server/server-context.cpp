@@ -106,6 +106,7 @@ enum slot_state {
     SLOT_STATE_PROCESSING_PROMPT,
     SLOT_STATE_DONE_PROMPT,
     SLOT_STATE_GENERATING,
+    SLOT_STATE_MANAGED_PAUSED,
 };
 
 struct server_slot; // forward declaration
@@ -282,6 +283,7 @@ struct server_slot {
     std::string  debug_generated_text;
     llama_tokens generated_tokens;
     size_t n_sent_text = 0; // number of sent text character (i.e. handle partial UTF-8 on streaming)
+    size_t n_sent_tokens = 0;
 
     std::vector<completion_token_output> generated_token_probs;
 
@@ -300,10 +302,14 @@ struct server_slot {
 
     uint64_t managed_revision = 0;
     bool managed_append_only = false;
-    // True when model-backed draft state remains safe for speculative use.
+    // True when target and model-backed draft state are coherent.
     bool managed_draft_coherent = false;
     // Only erase or restore can recover a partially mutated slot.
     bool managed_requires_rebuild = false;
+    // Managed vision (docs/managed-vision.md): token cell index in prompt.tokens
+    // -> fork-allocated chunk ID. The counter is monotonic for the slot's life.
+    std::map<size_t, uint64_t> managed_media_ids;
+    uint64_t managed_media_next_id = 1;
 
     void commit_managed_slot(bool draft_coherent) {
         managed_append_only = true;
@@ -372,6 +378,7 @@ struct server_slot {
         }
 
         prompt.clear();
+        managed_media_ids.clear();
         if (reset_managed) {
             reset_managed_slot();
         }
@@ -416,6 +423,7 @@ struct server_slot {
         stop           = STOP_TYPE_NONE;
         stopping_word  = "";
         n_sent_text    = 0;
+        n_sent_tokens  = 0;
 
         if (can_speculate()) {
             spec_draft.clear();
@@ -511,9 +519,12 @@ struct server_slot {
     }
 
     int n_context_tokens() const {
-        return managed_append_only
-            ? (int) prompt.tokens.size_live_text()
-            : prompt.n_tokens();
+        if (!managed_append_only) {
+            return prompt.n_tokens();
+        }
+        return prompt.tokens.has_mtmd
+            ? (int) prompt.tokens.pos_next()
+            : (int) prompt.tokens.size_live_text();
     }
 
     void add_token(const completion_token_output & token) {
@@ -788,10 +799,9 @@ struct server_slot {
 // note: this is not a member of server_slot because we want to run it inside yield_to_queue
 //       slot is passed as const to avoid accidental modification of the slot state
 //       some pointers are allowed to be used, they are not used by to_json()
-static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch, size_t idx, size_t & n_tokens_out) {
+static int process_mtmd_chunk(const server_slot & slot, const server_tokens & input_tokens, mtmd::batch_ptr & mbatch, size_t idx, size_t & n_tokens_out, bool mirror_draft) {
     GGML_ASSERT(slot.mctx);
     const auto & mctx = slot.mctx;
-    const auto & input_tokens = slot.task->tokens;
     const auto & chunk = input_tokens.find_chunk(idx);
     int32_t res = 0;
 
@@ -800,7 +810,7 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
             float * embd = mtmd_batch_get_output_embd(mbatch.get(), chunk.get());
             if (embd) {
                 void * cb_data = slot.spec;
-                static auto cb = [](llama_batch batch, void * user_data) {
+                static mtmd_helper_post_decode_callback cb = [](llama_batch batch, void * user_data) -> int32_t {
                     common_speculative * spec = static_cast<common_speculative *>(user_data);
                     if (!common_speculative_process(spec, batch)) {
                         return 1;
@@ -818,8 +828,8 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
                     slot.id,
                     llama_n_batch(slot.ctx_tgt),
                     &new_n_past,
-                    cb,
-                    cb_data
+                    mirror_draft ? cb : nullptr,
+                    mirror_draft ? cb_data : nullptr
                 );
                 if (res != 0) {
                     SLT_ERR(slot, "failed to decode mtmd chunk, idx = %zu, res = %d\n", idx, res);
@@ -2089,12 +2099,13 @@ private:
     }
 
     bool check_managed_slot(const server_slot & slot, const int id_task) {
-        if (slot.prompt.tokens.has_mtmd) {
-            send_error(id_task,
-                "Managed KV operations do not support slots configured with an mmproj",
-                ERROR_TYPE_NOT_SUPPORTED);
-            return false;
-        }
+        // Note: a server configured with an mmproj is allowed to run managed
+        // operations. Text-only operations are unaffected (no media cells in
+        // the ledger, positions are plain causal counters), and media
+        // operations validate their own capability (slot.mctx) at the task.
+        // A media cell is unambiguously identified by map_idx_to_media, so
+        // LLAMA_TOKEN_NULL holes and multimodal placeholders cannot be
+        // confused (see docs/managed-vision.md).
         if (slot.managed_requires_rebuild) {
             send_error(id_task,
                 "The managed slot was partially mutated and must be erased or restored before reuse",
@@ -2122,6 +2133,10 @@ private:
         } else {
             res->content = tkn.text_to_send;
             res->tokens  = { tkn.tok };
+            if (slot.task->slot_action.managed_native) {
+                res->tokens.assign(slot.generated_tokens.begin() + slot.n_sent_tokens, slot.generated_tokens.end());
+                slot.n_sent_tokens = slot.generated_tokens.size();
+            }
         }
 
         res->n_decoded             = slot.stats.n_gen;
@@ -2163,7 +2178,7 @@ private:
         // in stream mode, content and tokens are already in last partial chunk
         if (slot.task->params.stream) {
             res->content     = "";
-            res->tokens      = llama_tokens{};
+            res->tokens      = slot.task->slot_action.managed_native ? std::move(slot.generated_tokens) : llama_tokens{};
         } else {
             res->content     = std::move(slot.generated_text);
             res->tokens      = std::move(slot.generated_tokens);
@@ -2192,11 +2207,9 @@ private:
         if (slot.task->slot_action.managed_native) {
             res->managed_native      = true;
             res->n_managed_appended  = slot.task->slot_action.tokens.size();
-            const size_t managed_tail = slot.stats.n_gen + res->n_managed_appended;
-            const size_t managed_prompt_size = slot.prompt.tokens.size();
-            res->managed_pos_start = managed_prompt_size >= managed_tail
-                ? (llama_pos) (managed_prompt_size - managed_tail)
-                : -1;
+            // Sampled EOS can be absent from the decoded prompt ledger. Deriving
+            // the append boundary from n_gen therefore reports one position early.
+            res->managed_pos_start = slot.task->slot_action.managed_pos_start;
             res->managed_revision    = slot.managed_revision;
             res->managed_append_only = slot.managed_append_only;
             res->managed_draft_coherent = slot.managed_draft_coherent;
@@ -2711,15 +2724,15 @@ private:
 
                         slot->prompt.clear();
                         slot->prompt.tokens = std::move(restored);
-                        slot->managed_append_only = false;
-                        slot->managed_draft_coherent = false;
-                        slot->managed_requires_rebuild = false;
-                        slot->managed_revision++;
                     } catch (const std::exception & err) {
                         slot->prompt_clear();
                         send_error(task, std::string("Unable to restore slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);
                         break;
                     }
+                    slot->managed_append_only = false;
+                    slot->managed_draft_coherent = false;
+                    slot->managed_requires_rebuild = false;
+                    slot->managed_revision++;
 
                     const int64_t t_end = ggml_time_us();
                     const double t_restore_ms = (t_end - t_start) / 1000.0;
@@ -2775,7 +2788,13 @@ private:
                         send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
                         break;
                     }
-                    if (slot->is_processing()) {
+                    const bool resume_generation = task.slot_action.resume_generation;
+                    if (resume_generation && (slot->state != SLOT_STATE_MANAGED_PAUSED ||
+                            !slot->task || slot->task->id != task.slot_action.generation_task_id)) {
+                        send_error(task, "Rolling edit does not own the paused generation", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    if (slot->is_processing() && !resume_generation) {
                         SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
                         queue_tasks.defer(std::move(task));
                         break;
@@ -2785,6 +2804,7 @@ private:
                     }
 
                     if (!task.slot_action.edits.empty()) {
+                        const bool ledger_has_media = !slot->managed_media_ids.empty();
                         if (task.slot_action.expected_revision >= 0 && (uint64_t) task.slot_action.expected_revision != slot->managed_revision) {
                             send_error(task, "KV edit revision does not match the managed slot", ERROR_TYPE_INVALID_REQUEST);
                             break;
@@ -2796,17 +2816,17 @@ private:
                         const auto has_spec_type = [this](common_speculative_type type) {
                             return std::find(params_base.speculative.types.begin(), params_base.speculative.types.end(), type) != params_base.speculative.types.end();
                         };
-                        const bool dflash_spec =
-                            has_spec_type(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) &&
+                        const bool dflash_family_dual_edit =
+                            (has_spec_type(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) ||
+                             has_spec_type(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK)) &&
                             !has_spec_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP) &&
                             !has_spec_type(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3) &&
                             !has_spec_type(COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE);
-                        // Target verification permits stale DFlash proposal features.
-                        const bool retain_dflash_draft = dual_context && attention_only &&
-                            !task.slot_action.compact_positions && dflash_spec;
-                        const bool dflash_dual_edit = false;
-                        const bool compact_dflash = false;
-                        const bool edit_draft = dual_context && (!task.slot_action.compact_positions || compact_dflash) && (!attention_only || dflash_dual_edit);
+                        // DFlash and DSpark share the same position-local draft cache. DSpark's
+                        // additional Markov head is stateless, so it needs no separate edit.
+                        // cache_edits uses causal positions for both caches, including text after images.
+                        const bool compact_dflash_family = dual_context && slot->managed_draft_coherent && task.slot_action.compact_positions && dflash_family_dual_edit;
+                        const bool edit_draft = dual_context && slot->managed_draft_coherent && (!task.slot_action.compact_positions || compact_dflash_family) && (!(attention_only || ledger_has_media) || dflash_family_dual_edit);
                         if (attention_only) {
                             if (llama_memory_seq_pos_max_attention_only(mem, slot->id) < 0) {
                                 send_error(task, "Experimental attention-only KV edit requires hybrid memory", ERROR_TYPE_NOT_SUPPORTED);
@@ -2830,22 +2850,20 @@ private:
                             send_error(task, "KV edit position compaction is not supported by this memory layout", ERROR_TYPE_NOT_SUPPORTED);
                             break;
                         }
-                        if (compact_dflash && !llama_memory_can_shift_text_only(mem_dft)) {
-                            send_error(task, "DFlash KV position compaction is not supported by this memory layout", ERROR_TYPE_NOT_SUPPORTED);
+                        if (compact_dflash_family && !llama_memory_can_shift_text_only(mem_dft)) {
+                            send_error(task, "DFlash-family KV position compaction is not supported by this memory layout", ERROR_TYPE_NOT_SUPPORTED);
                             break;
                         }
 
-                        llama_pos last_end = pos_min_before;
+                        llama_pos last_end = 0;
                         size_t n_removed = 0;
                         size_t n_inserted = 0;
                         bool valid = true;
                         bool decoded = true;
                         bool target_mutated = false;
-                        const llama_pos edit_pos_limit = task.slot_action.compact_positions
-                            ? static_cast<llama_pos>(slot->prompt.tokens.size())
-                            : pos_max_before + 1;
+                        const llama_pos edit_pos_limit = static_cast<llama_pos>(slot->prompt.tokens.size());
                         for (const auto & edit : task.slot_action.edits) {
-                            if (edit.p0 < pos_min_before || edit.p1 <= edit.p0 || edit.p1 > edit_pos_limit || edit.p0 < last_end || edit.tokens.size() > (size_t) (edit.p1 - edit.p0)) {
+                            if (edit.p0 < 0 || edit.p1 <= edit.p0 || edit.p1 > edit_pos_limit || edit.p0 < last_end || edit.tokens.size() > (size_t) (edit.p1 - edit.p0)) {
                                 valid = false;
                                 break;
                             }
@@ -2867,58 +2885,157 @@ private:
                             break;
                         }
 
-                        llama_tokens compacted_prompt_tokens;
+                        // Requests index ledger cells. Memory operations use causal positions.
+                        // Images are atomic and can only be removed through media_retire.
+                        auto cache_edits = task.slot_action.edits;
+                        for (auto & edit : cache_edits) {
+                            for (const auto & media : slot->managed_media_ids) {
+                                const size_t media_end = media.first + mtmd_input_chunk_get_n_tokens(slot->prompt.tokens.find_chunk(media.first).get());
+                                if (size_t(edit.p0) < media_end && size_t(edit.p1) > media.first) {
+                                    valid = false;
+                                    break;
+                                }
+                            }
+                            if (!valid) {
+                                break;
+                            }
+                            edit.p0 = slot->prompt.tokens.pos_next(edit.p0);
+                            edit.p1 = slot->prompt.tokens.pos_next(edit.p1);
+                            if (edit.p0 < pos_min_before ||
+                                    (!task.slot_action.compact_positions && edit.p1 > pos_max_before + 1)) {
+                                valid = false;
+                                break;
+                            }
+                        }
+                        if (!valid) {
+                            send_error(task, "KV text edits must not overlap media and must address cached text positions", ERROR_TYPE_INVALID_REQUEST);
+                            break;
+                        }
+                        if (resume_generation) {
+                            const auto & edits = cache_edits;
+                            const llama_pos generated_start = slot->task->slot_action.managed_pos_start + slot->task->slot_action.tokens.size();
+                            if (!task.slot_action.compact_positions || edits.size() != 1 ||
+                                    edits[0].p0 < generated_start || edits[0].p1 >= slot->prompt.tokens.pos_next() ||
+                                    edits[0].tokens.size() >= size_t(edits[0].p1 - edits[0].p0)) {
+                                send_error(task, "Rolling edit must shrink an interior generated range and preserve the pending tail", ERROR_TYPE_INVALID_REQUEST);
+                                break;
+                            }
+                        }
+                        if (pos_max_before >= slot->prompt.tokens.pos_next()) {
+                            send_error(task, "KV edit prompt ledger is shorter than its physical slot", ERROR_TYPE_SERVER);
+                            break;
+                        }
                         if (task.slot_action.compact_positions) {
-                            if (slot->prompt.tokens.find_next_media_chunk(0).first != nullptr) {
-                                send_error(task, "KV edit position compaction requires a text-only prompt ledger", ERROR_TYPE_NOT_SUPPORTED);
-                                break;
-                            }
-                            const auto & prompt_tokens = slot->prompt.tokens.get_tokens();
-                            if ((size_t) (pos_max_before + 1) > prompt_tokens.size()) {
-                                send_error(task, "KV edit prompt ledger is shorter than its physical slot", ERROR_TYPE_SERVER);
-                                break;
-                            }
-                            bool compact_ranges_are_empty = true;
                             for (const auto & edit : task.slot_action.edits) {
                                 if (!edit.tokens.empty()) {
                                     continue;
                                 }
-                                for (llama_pos pos = edit.p0; pos < edit.p1; ++pos) {
-                                    if (prompt_tokens[static_cast<size_t>(pos)] != LLAMA_TOKEN_NULL) {
-                                        compact_ranges_are_empty = false;
+                                for (llama_pos c = edit.p0; c < edit.p1; ++c) {
+                                    if (slot->prompt.tokens[c] != LLAMA_TOKEN_NULL) {
+                                        valid = false;
                                         break;
                                     }
                                 }
-                                if (!compact_ranges_are_empty) {
-                                    break;
-                                }
                             }
-                            if (!compact_ranges_are_empty) {
+                            if (!valid) {
                                 send_error(task, "KV hole compaction requires already-released prompt ranges", ERROR_TYPE_INVALID_REQUEST);
                                 break;
                             }
-                            compacted_prompt_tokens.reserve(prompt_tokens.size() - n_removed + n_inserted);
-                            size_t cursor = 0;
-                            for (const auto & edit : task.slot_action.edits) {
-                                const size_t p0 = static_cast<size_t>(edit.p0);
-                                const size_t p1 = static_cast<size_t>(edit.p1);
-                                compacted_prompt_tokens.insert(
-                                    compacted_prompt_tokens.end(),
-                                    prompt_tokens.begin() + cursor,
-                                    prompt_tokens.begin() + p0);
-                                compacted_prompt_tokens.insert(
-                                    compacted_prompt_tokens.end(),
-                                    edit.tokens.begin(),
-                                    edit.tokens.end());
-                                cursor = p1;
-                            }
-                            compacted_prompt_tokens.insert(
-                                compacted_prompt_tokens.end(),
-                                prompt_tokens.begin() + cursor,
-                                prompt_tokens.end());
                         }
 
+                        // Prepare the new ledger before mutation. Retained chunks are copied as
+                        // metadata; no retained text or image is decoded again.
+                        server_tokens edited_prompt;
+                        edited_prompt.has_mtmd = slot->prompt.tokens.has_mtmd;
+                        std::map<size_t, uint64_t> edited_media_ids;
+                        size_t cursor = 0;
+                        const auto retain_to = [&](size_t end) {
+                            while (cursor < end) {
+                                auto media = slot->managed_media_ids.find(cursor);
+                                if (media != slot->managed_media_ids.end()) {
+                                    const auto * chunk = slot->prompt.tokens.find_chunk(cursor).get();
+                                    edited_media_ids[edited_prompt.size()] = slot->managed_media_ids.at(cursor);
+                                    edited_prompt.push_back(chunk);
+                                    cursor += mtmd_input_chunk_get_n_tokens(chunk);
+                                } else {
+                                    edited_prompt.insert({slot->prompt.tokens[cursor++]});
+                                }
+                            }
+                        };
                         for (const auto & edit : task.slot_action.edits) {
+                            retain_to(edit.p0);
+                            for (auto token : edit.tokens) {
+                                edited_prompt.push_back(token);
+                            }
+                            if (!task.slot_action.compact_positions) {
+                                for (size_t i = edit.tokens.size(); i < size_t(edit.p1 - edit.p0); ++i) {
+                                    edited_prompt.insert({LLAMA_TOKEN_NULL});
+                                }
+                            }
+                            cursor = edit.p1;
+                        }
+                        retain_to(slot->prompt.tokens.size());
+
+                        auto study_snapshot = [&]() {
+                            const size_t size = llama_state_seq_get_size_ext(ctx_tgt, slot->id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                            std::vector<uint8_t> state(size);
+                            if (size == 0 || llama_state_seq_get_data_ext(ctx_tgt, state.data(), size, slot->id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != size) {
+                                throw std::runtime_error("Study recurrent-state snapshot failed");
+                            }
+                            llama_tokens position_tokens;
+                            position_tokens.reserve(slot->prompt.tokens.size());
+                            for (size_t c = 0; c < slot->prompt.tokens.size(); ++c) {
+                                position_tokens.push_back(slot->prompt.tokens[c]);
+                            }
+                            json snapshot = {
+                                { "position_tokens", position_tokens },
+                                { "recurrent_state_bytes", size },
+                                { "recurrent_state_sha256", sha256_hex(state.data(), state.size()) },
+                                { "attention_pos_min", llama_memory_seq_pos_min_attention_only(mem, slot->id) },
+                                { "attention_pos_max", llama_memory_seq_pos_max_attention_only(mem, slot->id) },
+                            };
+                            // Qwen35 without SWA serializes recurrent cells as count,
+                            // (position, sequence-count) pairs, then tensor data.
+                            // Exclude position metadata when testing tensor preservation.
+                            snapshot["model_hybrid"] = llama_model_is_hybrid(llama_get_model(ctx_tgt));
+                            const size_t envelope = sizeof(uint32_t) + sizeof(llama_seq_id);
+                            if (llama_model_is_hybrid(llama_get_model(ctx_tgt)) && state.size() >= envelope + sizeof(uint32_t)) {
+                                uint32_t magic = 0;
+                                llama_seq_id saved_seq = -1;
+                                memcpy(&magic, state.data(), sizeof(magic));
+                                memcpy(&saved_seq, state.data() + sizeof(magic), sizeof(saved_seq));
+                                uint32_t count = 0;
+                                memcpy(&count, state.data() + envelope, sizeof(count));
+                                const size_t header = envelope + sizeof(uint32_t) + size_t(count) * (sizeof(llama_pos) + sizeof(uint32_t));
+                                bool recurrent_layout = magic == 0xaf143cd8 && saved_seq == slot->id && count > 0 && header < state.size();
+                                json positions = json::array();
+                                for (uint32_t i = 0; recurrent_layout && i < count; ++i) {
+                                    const size_t offset = envelope + sizeof(uint32_t) + size_t(i) * (sizeof(llama_pos) + sizeof(uint32_t));
+                                    llama_pos position;
+                                    uint32_t sequence_count;
+                                    memcpy(&position, state.data() + offset, sizeof(position));
+                                    memcpy(&sequence_count, state.data() + offset + sizeof(position), sizeof(sequence_count));
+                                    recurrent_layout = sequence_count == 0;
+                                    positions.push_back(position);
+                                }
+                                if (recurrent_layout) {
+                                    snapshot["recurrent_positions"] = positions;
+                                    snapshot["recurrent_tensor_sha256"] = sha256_hex(state.data() + header, state.size() - header);
+                                }
+                            }
+                            return snapshot;
+                        };
+                        json study_before;
+                        if (task.slot_action.study_diagnostics) {
+                            try {
+                                study_before = study_snapshot();
+                            } catch (const std::exception & exc) {
+                                send_error(task, exc.what(), ERROR_TYPE_SERVER);
+                                break;
+                            }
+                        }
+
+                        for (const auto & edit : cache_edits) {
                             if (!(attention_only ? llama_memory_seq_rm_attention_only(mem, slot->id, edit.p0, edit.p1) : llama_memory_seq_rm(mem, slot->id, edit.p0, edit.p1))) {
                                 send_error(task, "KV edit is not supported by this memory layout", ERROR_TYPE_NOT_SUPPORTED);
                                 valid = false;
@@ -2937,26 +3054,36 @@ private:
                             }
                             break;
                         }
-                        if (dual_context && !edit_draft && !retain_dflash_draft) {
+                        if (dual_context && !edit_draft) {
                             // Do not leave stale draft KV addressable after target-only surgery.
                             llama_memory_seq_rm(mem_dft, slot->id, -1, -1);
                         }
 
                         llama_pos shift_before = 0;
                         if (task.slot_action.compact_positions) {
-                            for (const auto & edit : task.slot_action.edits) {
+                            llama_pos recurrent_tail = slot->prompt.tokens.pos_next() - 1;
+                            for (const auto & edit : cache_edits) {
                                 const llama_pos n_removed_edit = edit.p1 - edit.p0;
                                 const llama_pos shift = (llama_pos) edit.tokens.size() - n_removed_edit;
                                 llama_memory_seq_add_text_only(mem, slot->id, edit.p1 + shift_before, -1, shift);
-                                if (compact_dflash) {
+                                if (recurrent_tail >= edit.p1 + shift_before) {
+                                    recurrent_tail += shift;
+                                }
+                                if (compact_dflash_family) {
                                     llama_memory_seq_add_text_only(mem_dft, slot->id, edit.p1 + shift_before, -1, shift);
                                 }
                                 shift_before += shift;
                             }
+                            // A removed tail has no retained suffix to shift its recurrent position.
+                            const llama_pos compacted_tail = edited_prompt.pos_next() - 1;
+                            if (attention_only && recurrent_tail > compacted_tail && compacted_tail >= 0) {
+                                llama_memory_seq_add_text_only(mem, slot->id, recurrent_tail, recurrent_tail + 1, compacted_tail - recurrent_tail);
+                                SLT_INF(*slot, "managed recurrent tail rebase: %d -> %d\n", recurrent_tail, compacted_tail);
+                            }
                         }
 
                         shift_before = 0;
-                        for (const auto & edit : task.slot_action.edits) {
+                        for (const auto & edit : cache_edits) {
                             if (edit.tokens.empty()) {
                                 if (task.slot_action.compact_positions) {
                                     shift_before += (llama_pos) edit.tokens.size() - (edit.p1 - edit.p0);
@@ -2989,7 +3116,7 @@ private:
                                     }
                                 }
                                 const int ret = llama_decode_ext(ctx_tgt, batch, LLAMA_DECODE_FLAG_ALLOW_NONSEQUENTIAL);
-                                const bool draft_ok = ret == 0 && (!edit_draft || common_speculative_process(spec.get(), batch));
+                                const bool draft_ok = ret == 0 && (!edit_draft || common_speculative_process(spec.get(), batch, true));
                                 llama_batch_free(batch);
                                 if (attention_only && llama_state_seq_set_data_ext(ctx_tgt, recurrent_state.data(), recurrent_state.size(), slot->id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != recurrent_state.size()) {
                                     send_error(task, "Experimental attention-only KV edit could not restore recurrent state", ERROR_TYPE_SERVER);
@@ -3015,38 +3142,47 @@ private:
                             break;
                         }
 
-                        // LLAMA_TOKEN_NULL entries preserve holes in the position-aligned ledger.
-                        if (task.slot_action.compact_positions) {
-                            slot->prompt.tokens.clear();
-                            slot->prompt.tokens.insert(compacted_prompt_tokens);
-                        } else {
-                            for (const auto & edit : task.slot_action.edits) {
-                                for (llama_pos pos = edit.p0; pos < edit.p1; ++pos) {
-                                    const size_t index = static_cast<size_t>(pos);
-                                    if (index >= slot->prompt.tokens.size()) {
-                                        send_error(task, "KV edit prompt ledger is shorter than its physical slot", ERROR_TYPE_SERVER);
-                                        decoded = false;
-                                        break;
-                                    }
-                                    const size_t replacement_index = static_cast<size_t>(pos - edit.p0);
-                                    slot->prompt.tokens.set_token(index,
-                                        replacement_index < edit.tokens.size()
-                                            ? edit.tokens[replacement_index]
-                                            : LLAMA_TOKEN_NULL);
-                                }
-                                if (!decoded) {
-                                    break;
-                                }
-                            }
-                            if (!decoded) {
+                        slot->prompt.tokens = std::move(edited_prompt);
+                        slot->managed_media_ids = std::move(edited_media_ids);
+
+                        slot->prompt.checkpoints.clear();
+                        slot->commit_managed_slot(edit_draft);
+
+                        if (resume_generation) {
+                            // Keep the task, sampler, output counter, pending sampled
+                            // token and verified speculative state. No prompt replay.
+                            slot->state = SLOT_STATE_GENERATING;
+                            SLT_INF(*slot, "rolling resume: task=%d, generated=%d, resident=%d, revision=%" PRIu64 "\n",
+                                    slot->task->id, (int) slot->stats.n_gen, slot->n_context_tokens(), slot->managed_revision);
+                        }
+
+                        auto res = std::make_unique<server_task_result_slot_kv_edit>();
+                        if (task.slot_action.study_diagnostics) {
+                            try {
+                                res->study_diagnostics = json {
+                                    { "before", study_before },
+                                    { "after", study_snapshot() },
+                                    { "decoded_target_tokens", n_inserted },
+                                    { "draft_updated", edit_draft },
+                                    { "attention_tensor_checksums_available", false },
+                                };
+                            } catch (const std::exception & exc) {
                                 slot->poison_managed_slot();
+                                send_error(task, exc.what(), ERROR_TYPE_SERVER);
                                 break;
                             }
                         }
-
-                        slot->commit_managed_slot(edit_draft || retain_dflash_draft);
-
-                        auto res = std::make_unique<server_task_result_slot_kv_edit>();
+                        for (const auto & media : slot->managed_media_ids) {
+                            const auto * chunk = slot->prompt.tokens.find_chunk(media.first).get();
+                            const auto pos = slot->prompt.tokens.pos_next(media.first);
+                            res->media.push_back(json {
+                                { "media_chunk_id", "fork-media:" + std::to_string(media.second) },
+                                { "token_start", media.first },
+                                { "token_end", media.first + mtmd_input_chunk_get_n_tokens(chunk) },
+                                { "position_start", pos },
+                                { "position_end", pos + mtmd_input_chunk_get_n_pos(chunk) },
+                            });
+                        }
                         res->id             = task.id;
                         res->id_slot        = id_slot;
                         res->n_removed      = n_removed;
@@ -3098,6 +3234,205 @@ private:
                         break;
                     }
 
+                    if (!task.slot_action.multimodal_data.empty()) {
+                        // ---- Managed vision append (docs/managed-vision.md) ----
+                        if (slot->mctx == nullptr) {
+                            send_error(task, "Media append requires a server configured with --mmproj", ERROR_TYPE_NOT_SUPPORTED);
+                            break;
+                        }
+                        if (task.slot_action.continue_generation || !task.slot_action.tokens.empty()) {
+                            send_error(task, "Media append must not combine tokens or continue_generation", ERROR_TYPE_INVALID_REQUEST);
+                            break;
+                        }
+                        if (task.slot_action.prompt.empty()) {
+                            send_error(task, "Media append requires a non-empty rendered prompt", ERROR_TYPE_INVALID_REQUEST);
+                            break;
+                        }
+
+                        // Pre-mutation validation: tokenize and resolve all geometry.
+                        // Failure here never mutates the slot and never bumps the revision.
+                        server_tokens input_tokens;
+                        try {
+                            input_tokens = process_mtmd_prompt(slot->mctx, task.slot_action.prompt, task.slot_action.multimodal_data, init_opt);
+                        } catch (const std::exception & e) {
+                            send_error(task, std::string("Failed to process multimodal prompt: ") + e.what(), ERROR_TYPE_INVALID_REQUEST);
+                            break;
+                        }
+                        if (input_tokens.empty()) {
+                            send_error(task, "Multimodal prompt produced no tokens", ERROR_TYPE_INVALID_REQUEST);
+                            break;
+                        }
+
+                        const llama_memory_t mem = llama_get_memory(ctx_tgt);
+                        const llama_pos pos_max = llama_memory_seq_pos_max(mem, slot->id);
+                        const llama_pos append_pos = pos_max + 1;
+                        const llama_pos n_pos_total = input_tokens.pos_next();
+                        if (append_pos + n_pos_total - 1 > slot->n_ctx) {
+                            send_error(task.id, "Multimodal prompt exceeds the slot context size",
+                                       ERROR_TYPE_EXCEED_CONTEXT_SIZE, (int32_t) input_tokens.size(), slot->n_ctx);
+                            break;
+                        }
+
+                        SRV_INF("KV append (media): slot %d, pos_max = %d, cells = %zu, pos = %d\n",
+                                id_slot, pos_max, input_tokens.size(), n_pos_total);
+
+                        // Decode the appended range in order of occurrence: text runs go into an
+                        // ordinary batch, media chunks through the standard mtmd chunk decoder.
+                        // The slot ledger advances in lockstep so that pos_next() stays authoritative.
+                        const size_t n_cells = input_tokens.size();
+                        const size_t n_batch = std::max<size_t>(1, llama_n_batch(ctx_tgt));
+                        const bool update_draft = bootstrap_prefill || slot->managed_draft_coherent;
+                        const bool has_draft = spec != nullptr && ctx_dft != nullptr;
+                        if (bootstrap_prefill) {
+                            slot->prompt.tokens.clear();
+                        }
+                        const size_t append_start_cell = slot->prompt.tokens.size();
+                        bool decoded = true;
+                        bool draft_ok = true;
+
+                        for (size_t i = 0; i < n_cells && decoded; ) {
+                            if (input_tokens[i] == LLAMA_TOKEN_NULL) {
+                                // media chunk at cell i
+                                const auto & chunk = input_tokens.find_chunk(i);
+                                const size_t chunk_cells = mtmd_input_chunk_get_n_tokens(chunk.get());
+                                size_t n_tokens_out = 0;
+                                int32_t res = 0;
+                                queue_tasks.yield_to_queue([&]() {
+                                    res = process_mtmd_chunk(*slot, input_tokens, slot->mbatch, i, n_tokens_out, update_draft && has_draft);
+                                });
+                                if (res != 0) {
+                                    decoded = false;
+                                    break;
+                                }
+                                slot->prompt.tokens.push_back(chunk.get());
+                                i += chunk_cells;
+                            } else {
+                                // text run
+                                const llama_pos run_base = slot->prompt.tokens.pos_next();
+                                const size_t run_start = i;
+                                size_t n_in = 0;
+                                llama_batch batch = llama_batch_init(n_batch, 0, 1);
+                                while (i < n_cells && input_tokens[i] != LLAMA_TOKEN_NULL && n_in < n_batch) {
+                                    batch.token[n_in] = input_tokens[i];
+                                    batch.pos[n_in] = run_base + n_in;
+                                    batch.n_seq_id[n_in] = 1;
+                                    batch.seq_id[n_in][0] = slot->id;
+                                    batch.logits[n_in] = (i + 1 == n_cells);
+                                    n_in++;
+                                    i++;
+                                }
+                                batch.n_tokens = n_in;
+                                const int ret = llama_decode(ctx_tgt, batch);
+                                if (ret == 0 && update_draft && has_draft) {
+                                    draft_ok = common_speculative_process(spec.get(), batch);
+                                }
+                                llama_batch_free(batch);
+                                if (ret != 0 || !draft_ok) {
+                                    decoded = false;
+                                    break;
+                                }
+                                for (size_t k = run_start; k < i; k++) {
+                                    slot->prompt.tokens.push_back(input_tokens[k]);
+                                }
+                            }
+                        }
+
+                        if (!decoded) {
+                            slot->mbatch.reset();
+                            slot->poison_managed_slot();
+                            send_error(task, "Media append decode failed; the slot must be rebuilt before reuse", ERROR_TYPE_SERVER);
+                            break;
+                        }
+
+                        // The encoded batch keeps pointers to the request-owned input chunks.
+                        // They become invalid when this task returns, so never retain the batch
+                        // for a later managed continuation. A later replay can re-encode from
+                        // the durable copies in slot->prompt.tokens.
+                        slot->mbatch.reset();
+
+                        // Allocate stable chunk IDs for the media cells in the appended range.
+                        {
+                            size_t request_idx = 0;
+                            for (size_t c = 0; c < n_cells; c++) {
+                                if (input_tokens[c] == LLAMA_TOKEN_NULL) {
+                                    const size_t chunk_cells = mtmd_input_chunk_get_n_tokens(input_tokens.find_chunk(c).get());
+                                    slot->managed_media_ids[append_start_cell + c] = slot->managed_media_next_id++;
+                                    c += chunk_cells - 1;
+                                    request_idx++;
+                                }
+                            }
+                        }
+
+                        slot->commit_managed_slot(bootstrap_prefill ? true : slot->managed_draft_coherent);
+
+                        // Acknowledge the exact token and position ranges (never derived by the router).
+                        const float * logits = llama_get_logits_ith(ctx_tgt, -1);
+                        const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_tgt)));
+                        llama_token token_probe = 0;
+                        for (llama_token token = 1; token < n_vocab; ++token) {
+                            if (logits[token] > logits[token_probe]) {
+                                token_probe = token;
+                            }
+                        }
+
+                        json media_arr = json::array();
+                        json tokens_echo = json::array();
+                        {
+                            const size_t end_cell = slot->prompt.tokens.size();
+                            size_t request_idx = 0;
+                            for (size_t c = 0; c < n_cells; c++) {
+                                const size_t slot_c = append_start_cell + c;
+                                const llama_token cell = slot->prompt.tokens[slot_c];
+                                if (cell == LLAMA_TOKEN_NULL) {
+                                    const auto & chunk = input_tokens.find_chunk(c);
+                                    const size_t chunk_cells = mtmd_input_chunk_get_n_tokens(chunk.get());
+                                    for (size_t k = 0; k < chunk_cells; k++) {
+                                        tokens_echo.push_back(nullptr);
+                                    }
+                                    const llama_pos pos_start = slot->prompt.tokens.pos_next((int64_t) slot_c);
+                                    const llama_pos n_pos = mtmd_input_chunk_get_n_pos(chunk.get());
+                                    const auto & data = task.slot_action.multimodal_data[request_idx];
+                                    media_arr.push_back(json {
+                                        { "index", request_idx },
+                                        { "media_chunk_id", "fork-media:" + std::to_string(slot->managed_media_ids[slot_c]) },
+                                        { "token_start", slot_c },
+                                        { "token_end", slot_c + chunk_cells },
+                                        { "position_start", pos_start },
+                                        { "position_end", pos_start + n_pos },
+                                        { "kv_cells", chunk_cells },
+                                        { "n_positions", n_pos },
+                                        { "grid", json {
+                                            { "t", 1 },
+                                            { "h", mtmd_input_chunk_get_ny(chunk.get()) },
+                                            { "w", mtmd_input_chunk_get_nx(chunk.get()) },
+                                        } },
+                                        { "sha256", sha256_hex(data.data(), data.size()) },
+                                    });
+                                    c += chunk_cells - 1;
+                                    request_idx++;
+                                } else {
+                                    tokens_echo.push_back((int64_t) cell);
+                                }
+                            }
+                        }
+
+                        auto res = std::make_unique<server_task_result_slot_kv_append>();
+                        res->id          = task.id;
+                        res->id_slot     = id_slot;
+                        res->n_appended  = n_cells;
+                        res->pos_start   = append_pos;
+                        res->pos_end     = slot->prompt.tokens.pos_next();
+                        res->token_probe = token_probe;
+                        res->managed_revision = slot->managed_revision;
+                        res->managed_append_only = slot->managed_append_only;
+                        res->managed_draft_coherent = slot->managed_draft_coherent;
+                        res->managed_requires_rebuild = slot->managed_requires_rebuild;
+                        res->media   = std::move(media_arr);
+                        res->tokens  = std::move(tokens_echo);
+                        queue_results.send(std::move(res));
+                        break;
+                    }
+
                     const llama_memory_t mem = llama_get_memory(ctx_tgt);
                     const llama_pos pos_max = llama_memory_seq_pos_max(mem, slot->id);
                     const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_tgt)));
@@ -3112,6 +3447,18 @@ private:
                     }
                     if (!valid) {
                         send_error(task, "KV append requires a non-empty cached slot and valid token IDs", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+
+                    const llama_pos append_start = pos_max + 1;
+                    const bool media_ledger = slot->prompt.tokens.has_mtmd;
+                    const llama_pos ledger_pos_next = slot->prompt.tokens.pos_next();
+                    const bool replace_terminal = media_ledger &&
+                        ledger_pos_next == append_start + 1 &&
+                        !slot->prompt.tokens.empty() &&
+                        slot->prompt.tokens[slot->prompt.tokens.size() - 1] != LLAMA_TOKEN_NULL;
+                    if (media_ledger && ledger_pos_next != append_start && !replace_terminal) {
+                        send_error(task, "KV append is not aligned with the multimodal ledger tail", ERROR_TYPE_INVALID_REQUEST);
                         break;
                     }
 
@@ -3152,16 +3499,24 @@ private:
                     if (bootstrap_prefill) {
                         slot->prompt.tokens.clear();
                     }
-                    const llama_pos append_start = pos_max + 1;
-                    for (size_t i = 0; i < task.slot_action.tokens.size(); ++i) {
-                        const size_t index = static_cast<size_t>(append_start) + i;
-                        while (slot->prompt.tokens.size() < index) {
-                            slot->prompt.tokens.push_back(LLAMA_TOKEN_NULL);
+                    if (media_ledger) {
+                        if (replace_terminal) {
+                            slot->prompt.tokens.keep_first(slot->prompt.tokens.size() - 1);
                         }
-                        if (slot->prompt.tokens.size() == index) {
-                            slot->prompt.tokens.push_back(task.slot_action.tokens[i]);
-                        } else {
-                            slot->prompt.tokens.set_token(index, task.slot_action.tokens[i]);
+                        for (const llama_token token : task.slot_action.tokens) {
+                            slot->prompt.tokens.push_back(token);
+                        }
+                    } else {
+                        for (size_t i = 0; i < task.slot_action.tokens.size(); ++i) {
+                            const size_t index = static_cast<size_t>(append_start) + i;
+                            while (slot->prompt.tokens.size() < index) {
+                                slot->prompt.tokens.push_back(LLAMA_TOKEN_NULL);
+                            }
+                            if (slot->prompt.tokens.size() == index) {
+                                slot->prompt.tokens.push_back(task.slot_action.tokens[i]);
+                            } else {
+                                slot->prompt.tokens.set_token(index, task.slot_action.tokens[i]);
+                            }
                         }
                     }
                     slot->commit_managed_slot(bootstrap_prefill ? true : slot->managed_draft_coherent);
@@ -3341,6 +3696,305 @@ private:
                         : "length";
                     queue_results.send(std::move(res));
                 } break;
+            case SERVER_TASK_TYPE_SLOT_MEDIA_RETIRE:
+                {
+                    const int id_slot = task.slot_action.id_slot;
+                    server_slot * slot = get_slot_by_id(id_slot);
+                    if (slot == nullptr) {
+                        send_error(task, "Invalid slot ID", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    if (!check_managed_slot(*slot, task.id)) {
+                        break;
+                    }
+                    if (slot->is_processing()) {
+                        SRV_DBG("requested slot is unavailable, defer task, id_task = %d\n", task.id);
+                        queue_tasks.defer(std::move(task));
+                        break;
+                    }
+                    if (task.slot_action.media_retire.empty()) {
+                        send_error(task, "media_retire requires a non-empty media list", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    if (task.slot_action.expected_revision >= 0 && (uint64_t) task.slot_action.expected_revision != slot->managed_revision) {
+                        send_error(task, "media_retire revision does not match the managed slot", ERROR_TYPE_INVALID_REQUEST);
+                        break;
+                    }
+                    const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx_tgt)));
+                    bool tombstone_valid = true;
+                    for (const llama_token token : task.slot_action.tombstone) {
+                        if (token < 0 || token >= n_vocab) {
+                            send_error(task, "tombstone contains invalid token IDs", ERROR_TYPE_INVALID_REQUEST);
+                            tombstone_valid = false;
+                            break;
+                        }
+                    }
+                    if (!tombstone_valid) {
+                        break;
+                    }
+
+                    // ---- Pre-mutation validation: resolve every handle and range. ----
+                    // Failure here never mutates the slot and never bumps the revision.
+                    struct resolved_chunk {
+                        size_t cell_start;
+                        size_t cell_end;
+                        llama_pos pos_start;
+                        llama_pos pos_end;
+                        size_t kv_cells;
+                        uint64_t id;
+                    };
+                    std::vector<resolved_chunk> resolved;
+                    {
+                        const auto & ledger = slot->prompt.tokens;
+                        const auto & ids = slot->managed_media_ids;
+                        std::unordered_set<uint64_t> seen;
+                        bool valid = true;
+                        for (const auto & req : task.slot_action.media_retire) {
+                            if (!seen.insert(req.media_chunk_id).second) {
+                                valid = false;
+                                break;
+                            }
+                            const auto id_it = std::find_if(
+                                ids.begin(), ids.end(),
+                                [&](const auto & item) {
+                                    return item.second == req.media_chunk_id;
+                                });
+                            if (id_it == ids.end()) {
+                                valid = false; // unknown or already-retired handle
+                                break;
+                            }
+                            const size_t c0 = id_it->first;
+                            const auto & chunk = ledger.find_chunk(c0).get();
+                            const size_t n_cells = mtmd_input_chunk_get_n_tokens(chunk);
+                            const llama_pos p0 = ledger.pos_next((int64_t) c0);
+                            const llama_pos p1 = p0 + mtmd_input_chunk_get_n_pos(chunk);
+                            if (c0 != (size_t) req.token_start || c0 + n_cells != (size_t) req.token_end ||
+                                p0 != req.position_start || p1 != req.position_end) {
+                                valid = false; // range drift
+                                break;
+                            }
+                            resolved.push_back({ c0, c0 + n_cells, p0, p1, n_cells, req.media_chunk_id });
+                        }
+                        if (!valid) {
+                            send_error(task, "media_retire validation failed: unknown handle or range drift", ERROR_TYPE_INVALID_REQUEST);
+                            break;
+                        }
+                    }
+                    std::sort(resolved.begin(), resolved.end(),
+                        [](const resolved_chunk & a, const resolved_chunk & b) {
+                            return a.pos_start < b.pos_start;
+                        });
+
+                    const llama_memory_t mem = llama_get_memory(ctx_tgt);
+                    if (!llama_memory_can_shift_text_only(mem)) {
+                        send_error(task, "media_retire position compaction is not supported by this memory layout", ERROR_TYPE_NOT_SUPPORTED);
+                        break;
+                    }
+                    const llama_memory_t mem_dft = ctx_dft ? llama_get_memory(ctx_dft) : nullptr;
+                    const bool dual_context = spec != nullptr && ctx_dft != nullptr;
+
+                    const auto has_spec_type = [this](common_speculative_type type) {
+                        return std::find(params_base.speculative.types.begin(), params_base.speculative.types.end(), type) != params_base.speculative.types.end();
+                    };
+                    const bool edit_draft = dual_context && slot->managed_draft_coherent &&
+                        (has_spec_type(COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) || has_spec_type(COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK)) &&
+                        !has_spec_type(COMMON_SPECULATIVE_TYPE_DRAFT_MTP) &&
+                        !has_spec_type(COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3) &&
+                        !has_spec_type(COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE);
+                    if (edit_draft && !llama_memory_can_shift_text_only(mem_dft)) {
+                        send_error(task, "media_retire draft position compaction is not supported by this memory layout", ERROR_TYPE_NOT_SUPPORTED);
+                        break;
+                    }
+
+                    // The tombstone is installed at the earliest released interval,
+                    // only when it fits that interval.
+                    const size_t first_released = (size_t) (resolved[0].pos_end - resolved[0].pos_start);
+                    const bool tombstone_fits = !task.slot_action.tombstone.empty() &&
+                        task.slot_action.tombstone.size() <= first_released;
+                    const size_t k = tombstone_fits ? task.slot_action.tombstone.size() : 0;
+
+                    size_t removed_kv_cells = 0;
+                    size_t removed_positions = 0;
+                    for (const auto & r : resolved) {
+                        removed_kv_cells += r.kv_cells;
+                        removed_positions += (size_t) (r.pos_end - r.pos_start);
+                    }
+
+                    SRV_INF("media_retire: slot %d, chunks = %zu, kv cells = %zu, positions = %zu, tombstone = %zu\n",
+                            id_slot, resolved.size(), removed_kv_cells, removed_positions, k);
+
+                    // ---- Mutation phase ----
+                    bool removed = true;
+                    for (const auto & r : resolved) {
+                        // All cells of a chunk share its base causal position, which is
+                        // exclusive to the chunk (text resumes at pos_start + n_pos).
+                        if (!llama_memory_seq_rm(mem, slot->id, r.pos_start, r.pos_end)) {
+                            slot->poison_managed_slot();
+                            send_error(task, "media_retire KV removal failed; the slot must be rebuilt", ERROR_TYPE_SERVER);
+                            removed = false;
+                            break;
+                        }
+                        // The draft stores one row per causal position, not one per image patch.
+                        if (edit_draft && !llama_memory_seq_rm(mem_dft, slot->id, r.pos_start, r.pos_end)) {
+                            slot->poison_managed_slot();
+                            send_error(task, "media_retire draft removal failed after target mutation", ERROR_TYPE_SERVER);
+                            removed = false;
+                            break;
+                        }
+                    }
+                    if (!removed) {
+                        break;
+                    }
+                    // Target-only mutation: do not leave stale draft KV addressable.
+                    if (dual_context && !edit_draft) {
+                        llama_memory_seq_rm(mem_dft, slot->id, -1, -1);
+                    }
+
+                    // Compaction: cumulative shift per hole, earliest first. The whole-vector
+                    // shift re-rotates cached K by the same scalar delta in every rotary
+                    // section, which preserves an M-RoPE image block's rigid (t,x,y) layout.
+                    llama_pos shift_before = 0;
+                    for (size_t i = 0; i < resolved.size(); ++i) {
+                        const auto & r = resolved[i];
+                        const size_t k_i = (i == 0) ? k : 0;
+                        const llama_pos shift = (llama_pos) k_i - (llama_pos) (r.pos_end - r.pos_start);
+                        llama_memory_seq_add_text_only(mem, slot->id, r.pos_end + shift_before, -1, shift);
+                        if (edit_draft) {
+                            llama_memory_seq_add_text_only(mem_dft, slot->id, r.pos_end + shift_before, -1, shift);
+                        }
+                        shift_before += shift;
+                    }
+
+                    // Decode the tombstone into its (partially) released interval.
+                    int64_t tombstone_token_start = -1;
+                    int64_t tombstone_position_start = -1;
+                    if (k > 0) {
+                        const size_t n_batch = std::max<size_t>(1, llama_n_batch(ctx_tgt));
+                        bool decoded = true;
+                        for (size_t off = 0; off < k && decoded; off += n_batch) {
+                            const size_t count = std::min(n_batch, k - off);
+                            llama_batch batch = llama_batch_init(count, 0, 1);
+                            batch.n_tokens = count;
+                            for (size_t i = 0; i < count; ++i) {
+                                batch.token[i] = task.slot_action.tombstone[off + i];
+                                batch.pos[i] = resolved[0].pos_start + off + i;
+                                batch.n_seq_id[i] = 1;
+                                batch.seq_id[i][0] = slot->id;
+                                batch.logits[i] = off + i + 1 == k;
+                            }
+                            const int ret = llama_decode_ext(ctx_tgt, batch, LLAMA_DECODE_FLAG_ALLOW_NONSEQUENTIAL);
+                            const bool draft_ok = ret == 0 && (!edit_draft || common_speculative_process(spec.get(), batch, true));
+                            llama_batch_free(batch);
+                            if (ret != 0 || !draft_ok) {
+                                slot->poison_managed_slot();
+                                send_error(task, "media_retire tombstone decode failed; the slot must be rebuilt", ERROR_TYPE_SERVER);
+                                decoded = false;
+                            }
+                        }
+                        if (!decoded) {
+                            break;
+                        }
+                        tombstone_position_start = resolved[0].pos_start;
+                    }
+
+                    // Rebuild the slot ledger: drop retired cells, install the tombstone,
+                    // keep surviving chunks (their ids follow their new cell indices).
+                    size_t shifted_text_cells = 0;
+                    {
+                        const auto & old = slot->prompt.tokens;
+                        server_tokens new_tokens;
+                        new_tokens.has_mtmd = old.has_mtmd;
+                        std::map<size_t, uint64_t> new_ids;
+                        const size_t first_retired_cell = resolved[0].cell_start;
+                        size_t r = 0;
+                        size_t c = 0;
+                        size_t new_cell = 0;
+                        while (c < old.size()) {
+                            if (r < resolved.size() && c == resolved[r].cell_start) {
+                                if (r == 0 && k > 0) {
+                                    for (const llama_token tok : task.slot_action.tombstone) {
+                                        new_tokens.push_back(tok);
+                                    }
+                                    tombstone_token_start = (int64_t) new_cell;
+                                    new_cell += k;
+                                }
+                                c = resolved[r].cell_end;
+                                r++;
+                                continue;
+                            }
+                            const llama_token cell = old[c];
+                            if (slot->managed_media_ids.count(c) != 0) {
+                                const auto & chunk = old.find_chunk(c).get();
+                                const size_t n_cells = mtmd_input_chunk_get_n_tokens(chunk);
+                                new_ids[new_cell] = slot->managed_media_ids[c];
+                                new_tokens.push_back(chunk);
+                                new_cell += n_cells;
+                                c += n_cells;
+                            } else {
+                                if (c >= first_retired_cell) {
+                                    shifted_text_cells++;
+                                }
+                                new_tokens.insert({cell});
+                                new_cell++;
+                                c++;
+                            }
+                        }
+                        slot->prompt.tokens = std::move(new_tokens);
+                        slot->managed_media_ids = std::move(new_ids);
+                    }
+
+                    slot->commit_managed_slot(edit_draft);
+
+                    // Acknowledge every live chunk with its updated ranges, plus one
+                    // retired entry per requested chunk (docs/managed-vision.md).
+                    json media_arr = json::array();
+                    {
+                        const auto & ledger = slot->prompt.tokens;
+                        size_t c = 0;
+                        while (c < ledger.size()) {
+                            const llama_token cell = ledger[c];
+                            if (slot->managed_media_ids.count(c) != 0) {
+                                const auto & chunk = ledger.find_chunk(c).get();
+                                const size_t n_cells = mtmd_input_chunk_get_n_tokens(chunk);
+                                const llama_pos p0 = ledger.pos_next((int64_t) c);
+                                const llama_pos p1 = p0 + mtmd_input_chunk_get_n_pos(chunk);
+                                media_arr.push_back(json {
+                                    { "media_chunk_id", "fork-media:" + std::to_string(slot->managed_media_ids[c]) },
+                                    { "token_start", c },
+                                    { "token_end", c + n_cells },
+                                    { "position_start", p0 },
+                                    { "position_end", p1 },
+                                });
+                                c += n_cells;
+                            } else {
+                                c++;
+                            }
+                        }
+                        for (const auto & req : task.slot_action.media_retire) {
+                            media_arr.push_back(json {
+                                { "media_chunk_id", "fork-media:" + std::to_string(req.media_chunk_id) },
+                                { "retired", true },
+                            });
+                        }
+                    }
+
+                    auto res = std::make_unique<server_task_result_slot_media_retire>();
+                    res->id                       = task.id;
+                    res->id_slot                  = id_slot;
+                    res->removed_kv_cells         = removed_kv_cells;
+                    res->removed_positions        = removed_positions;
+                    res->shifted_text_cells       = shifted_text_cells;
+                    res->positions_compacted      = true;
+                    res->tombstone_fits           = tombstone_fits;
+                    res->tombstone_token_start    = tombstone_token_start;
+                    res->tombstone_position_start = tombstone_position_start;
+                    res->managed_revision         = slot->managed_revision;
+                    res->managed_append_only      = slot->managed_append_only;
+                    res->managed_draft_coherent   = slot->managed_draft_coherent;
+                    res->managed_requires_rebuild = slot->managed_requires_rebuild;
+                    res->media                    = std::move(media_arr);
+                    queue_results.send(std::move(res));
+                } break;
             case SERVER_TASK_TYPE_SLOT_MANAGED_NATIVE_COMPLETION:
                 {
                     const int id_slot = task.slot_action.id_slot;
@@ -3381,8 +4035,13 @@ private:
                     completion.tokens.insert(task.slot_action.tokens);
                     completion.params  = std::move(task.params);
                     completion.params.res_type = TASK_RESPONSE_TYPE_NONE;
+                    completion.params.return_tokens = true;
+                    completion.params.cache_prompt = true;
                     completion.slot_action.managed_native = true;
+                    completion.slot_action.managed_pos_start = slot->prompt.tokens.pos_next();
                     completion.slot_action.continue_generation = task.slot_action.continue_generation;
+                    completion.slot_action.rolling_headroom = task.slot_action.rolling_headroom;
+                    completion.slot_action.rolling_context_limit = task.slot_action.rolling_context_limit;
                     completion.slot_action.expected_revision = task.slot_action.expected_revision;
                     completion.slot_action.tokens = std::move(task.slot_action.tokens);
 
@@ -3535,7 +4194,7 @@ private:
             bool all_idle = true;
 
             for (auto & slot : slots) {
-                if (slot.is_processing()) {
+                if (slot.is_processing() && slot.state != SLOT_STATE_MANAGED_PAUSED) {
                     all_idle = false;
                     break;
                 }
@@ -3633,6 +4292,36 @@ private:
     }
 
     void pre_decode() {
+        // Pause between completed verification batches, before scheduling any
+        // new draft or target work. The final sampled token is still pending.
+        iterate(slots, [&](server_slot & slot) {
+            if (slot.state != SLOT_STATE_GENERATING || !slot.task ||
+                    !slot.task->slot_action.managed_native || slot.task->slot_action.rolling_headroom <= 0 ||
+                    !slot.spec_draft.empty() || !slot.spec_i_batch.empty()) {
+                return;
+            }
+            const int limit = slot.task->slot_action.rolling_context_limit > 0
+                ? std::min(slot.n_ctx, slot.task->slot_action.rolling_context_limit) : slot.n_ctx;
+            if (limit - slot.n_context_tokens() > slot.task->slot_action.rolling_headroom) {
+                return;
+            }
+            slot.state = SLOT_STATE_MANAGED_PAUSED;
+            auto paused = std::make_unique<server_task_result_managed_pause>();
+            paused->id = slot.task->id;
+            paused->data = {
+                {"type", "managed_native_paused"}, {"id_task", slot.task->id},
+                {"managed_revision", slot.managed_revision},
+                {"tokens_generated", slot.generated_tokens}, {"tokens_predicted", slot.stats.n_gen},
+                {"tokens_cached", slot.n_context_tokens()}, {"context_limit", limit},
+                {"pos_start", slot.task->slot_action.managed_pos_start},
+                {"token_start", slot.task->slot_action.managed_pos_start == 0 ? 0 : slot.prompt.tokens.size_up_to_pos(slot.task->slot_action.managed_pos_start)},
+                {"ledger_cells", slot.prompt.tokens.size()},
+                {"n_appended", slot.task->slot_action.tokens.size()},
+            };
+            queue_results.send(std::move(paused));
+            SLT_INF(slot, "rolling pause: task=%d, generated=%d, resident=%d, limit=%d\n",
+                    slot.task->id, (int) slot.stats.n_gen, slot.n_context_tokens(), limit);
+        });
         // apply context-shift if needed
         // TODO: simplify and improve
         iterate(slots, [&](server_slot & slot) {
@@ -3931,7 +4620,9 @@ private:
                             }
                         } else {
                             const int n_request_context = slot.task->slot_action.managed_native
-                                ? (int) slot.task->tokens.size_live_text()
+                                ? (slot.task->tokens.has_mtmd
+                                    ? (int) slot.task->tokens.pos_next()
+                                    : (int) slot.task->tokens.size_live_text())
                                 : slot.task->n_tokens();
                             if (n_request_context >= slot.n_ctx) {
                                 send_error(slot,
@@ -4075,7 +4766,13 @@ private:
                                     SLT_WRN(slot, "%s\n", st1.str().c_str());
                                 }
 
-                                if (pos_min >= pos_min_thold) {
+                                if (slot.task->slot_action.managed_native && pos_min >= pos_next && has_new_tokens) {
+                                    send_error(slot, "Managed recurrent state is beyond the append boundary; explicit recovery is required", ERROR_TYPE_INVALID_REQUEST);
+                                    slot.release();
+                                    return;
+                                }
+
+                                if (pos_min >= pos_min_thold && !slot.task->slot_action.managed_native) {
                                     // search for a context checkpoint
                                     const auto it = std::find_if(
                                         slot.prompt.checkpoints.rbegin(),
@@ -4126,6 +4823,16 @@ private:
                                     }
                                 }
                             }
+                        }
+
+                        if (slot.task->slot_action.managed_native) {
+                            const int retained = slot.task->n_tokens() - (int) slot.task->slot_action.tokens.size();
+                            if (n_past != retained) {
+                                send_error(slot, "Managed continuation would replay retained prompt tokens", ERROR_TYPE_INVALID_REQUEST);
+                                slot.release();
+                                return;
+                            }
+                            SLT_INF(slot, "managed prefix retained = %d, new prompt tokens = %zu\n", n_past, slot.task->slot_action.tokens.size());
                         }
 
                         // [TAG_PROMPT_LOGITS]
@@ -4222,7 +4929,7 @@ private:
                         size_t n_tokens_out = 0;
                         int32_t res = 0;
                         queue_tasks.yield_to_queue([&]() {
-                            res = process_mtmd_chunk(slot, slot.mbatch, cur_token_idx, n_tokens_out);
+                            res = process_mtmd_chunk(slot, input_tokens, slot.mbatch, cur_token_idx, n_tokens_out, /*mirror_draft=*/true);
                         });
 
                         if (res != 0) {
@@ -5370,29 +6077,42 @@ static json get_res_props(const server_context_meta & meta, const common_params 
         { "build_info",                  meta.build_info },
         { "is_sleeping",                 is_sleeping },
         { "cors_proxy_enabled",          params.ui_mcp_proxy },
-        { "managed_slot", json {
-            { "api_version", 1 },
-            { "requires_slot_save_path", true },
-            { "requires_expected_revision", true },
-            { "reports_rebuild_required", true },
-            { "supports_mmproj", false },
-            { "supports_context_shift", false },
-            { "supports_slot_save", false },
-            { "edit", true },
-            { "append", true },
-            { "append_generate", true },
-            { "legacy_generate_deprecated", true },
-            { "bootstrap_generate", true },
-            { "native_completion", true },
-            { "native_bootstrap", true },
-            { "native_prefill_recovery", true },
-            { "native_continuation", true },
-            { "dual_kv_edit", true },
-            { "qwen_attention_only_dflash_dual_edit", false },
-            { "qwen_attention_only_dflash_dual_compact", false },
-            { "qwen_attention_only", true },
-            { "qwen_compact_positions", true },
-        } },
+            { "managed_slot", json {
+                { "api_version", 1 },
+                { "requires_slot_save_path", true },
+                { "requires_expected_revision", true },
+                { "reports_rebuild_required", true },
+                { "supports_mmproj", !is_sleeping && (meta.has_inp_image || meta.has_inp_audio) },
+                { "supports_context_shift", false },
+                { "supports_slot_save", false },
+                { "edit", true },
+                { "append", true },
+                { "append_generate", true },
+                { "legacy_generate_deprecated", true },
+                { "bootstrap_generate", true },
+                { "native_completion", true },
+                { "native_rolling_generation", true },
+                { "native_bootstrap", true },
+                { "native_prefill_recovery", true },
+                { "native_continuation", true },
+                { "dual_kv_edit", true },
+                { "qwen_attention_only_dflash_dual_edit", true },
+                { "qwen_attention_only_dflash_dual_compact", true },
+                { "qwen_attention_only_dspark_dual_edit", true },
+                { "qwen_attention_only_dspark_dual_compact", true },
+                { "qwen_attention_only", true },
+                { "qwen_compact_positions", true },
+                { "vision", !is_sleeping && (meta.has_inp_image || meta.has_inp_audio) },
+                { "vision_geometry", !is_sleeping && (meta.has_inp_image || meta.has_inp_audio) },
+                { "vision_span_prefill", !is_sleeping && (meta.has_inp_image || meta.has_inp_audio) },
+                { "vision_span_append", !is_sleeping && (meta.has_inp_image || meta.has_inp_audio) },
+                { "vision_span_retire", !is_sleeping && (meta.has_inp_image || meta.has_inp_audio) },
+                { "vision_retire_attention_only", !is_sleeping && (meta.has_inp_image || meta.has_inp_audio) },
+                { "vision_recurrent_replay", false },
+                { "mrope_compaction", !is_sleeping && meta.has_inp_image },
+                { "vision_text_edit", !is_sleeping && meta.has_inp_image },
+                { "video", false },
+            } },
     };
     if (params.use_jinja) {
         if (!tmpl_tools.empty()) {
@@ -5553,11 +6273,11 @@ void server_routes::init_routes() {
         if (action == "restore") {
             return handle_slots_restore(req, id_slot);
         }
-        if (action == "erase") {
-            return handle_slots_erase(req, id_slot);
-        }
         if (action == "cancel") {
             return handle_slots_cancel(req, id_slot);
+        }
+        if (action == "erase") {
+            return handle_slots_erase(req, id_slot);
         }
         if (action == "surgery" || action == "kv_edit") {
             return handle_slots_surgery(req, id_slot);
@@ -5567,6 +6287,12 @@ void server_routes::init_routes() {
         }
         if (action == "managed_native_prefill") {
             return handle_slots_kv_append(req, id_slot, true);
+        }
+        if (action == "image_geometry") {
+            return handle_slots_image_geometry(req, id_slot);
+        }
+        if (action == "media_retire") {
+            return handle_slots_media_retire(req, id_slot);
         }
         if (action == "managed_generate") {
             return handle_slots_managed_generate(req, id_slot);
@@ -6065,6 +6791,28 @@ void server_routes::init_routes() {
     };
 }
 
+// Strict base64 check for multimodal payloads: the lenient decoder below would
+// otherwise silently truncate at the first stray character.
+static bool is_valid_base64(const std::string & s) {
+    if (s.empty() || s.size() % 4 != 0) {
+        return false;
+    }
+    size_t pad = 0;
+    for (const char c : s) {
+        if (c == '=') {
+            pad++;
+            continue;
+        }
+        if (pad > 0) {
+            return false; // padding must be trailing
+        }
+        if (!isalnum((uint8_t) c) && c != '+' && c != '/') {
+            return false;
+        }
+    }
+    return pad <= 2;
+}
+
 static bool get_expected_revision(const json & body, int64_t & revision) {
     if (!body.contains("expected_revision")) {
         return false;
@@ -6075,14 +6823,8 @@ static bool get_expected_revision(const json & body, int64_t & revision) {
         return false;
     }
 
-    try {
-        size_t parsed = 0;
-        const std::string text = value.dump();
-        revision = std::stoll(text, &parsed);
-        return parsed == text.size() && revision >= 0;
-    } catch (const std::exception &) {
-        return false;
-    }
+    revision = value.get<int64_t>();
+    return revision >= 0;
 }
 
 std::unique_ptr<server_res_generator> server_routes::handle_slots_save(const server_http_req & req, int id_slot) {
@@ -6246,6 +6988,9 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_surgery(
         }
         task.slot_action.compact_positions = body.value("compact_positions", false);
         task.slot_action.experimental_attention_only = body.value("experimental_attention_only", false);
+        task.slot_action.study_diagnostics = body.value("study_diagnostics", false);
+        task.slot_action.generation_task_id = body.value("generation_task_id", -1);
+        task.slot_action.resume_generation = body.value("resume_generation", false);
         if (!get_expected_revision(body, task.slot_action.expected_revision)) {
             res->error(format_error_response("expected_revision must be a non-negative integer", ERROR_TYPE_INVALID_REQUEST));
             return res;
@@ -6274,7 +7019,36 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_kv_append(
     auto res = create_response();
     const json body = json::parse(req.body);
     const bool continue_generation = body.value("continue_generation", false);
-    if (!body.contains("tokens") || !body.at("tokens").is_array() || (body.at("tokens").empty() && !continue_generation)) {
+
+    // Managed vision form (docs/managed-vision.md): `prompt` + `multimodal_data`
+    // replaces `tokens`; the two are never combined.
+    const bool media_form = body.contains("multimodal_data") && body.at("multimodal_data").is_array();
+
+    if (media_form) {
+        const auto & mm_data = body.at("multimodal_data");
+        if (mm_data.empty()) {
+            res->error(format_error_response("an empty \"multimodal_data\" is a text-only append; send \"tokens\" instead", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        if (!body.contains("prompt") || !body.at("prompt").is_string() || body.at("prompt").get<std::string>().empty()) {
+            res->error(format_error_response("\"prompt\" must be a non-empty string when \"multimodal_data\" is present", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        if (body.contains("tokens")) {
+            res->error(format_error_response("\"tokens\" and \"multimodal_data\" are mutually exclusive", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        if (continue_generation) {
+            res->error(format_error_response("\"continue_generation\" is not supported with \"multimodal_data\"", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        for (const auto & entry : mm_data) {
+            if (!entry.is_string() || !is_valid_base64(entry.get<std::string>())) {
+                res->error(format_error_response("\"multimodal_data\" entries must be non-empty base64 strings", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+        }
+    } else if (!body.contains("tokens") || !body.at("tokens").is_array() || (body.at("tokens").empty() && !continue_generation)) {
         res->error(format_error_response("\"tokens\" must be a non-empty array unless continue_generation=true", ERROR_TYPE_INVALID_REQUEST));
         return res;
     }
@@ -6284,7 +7058,18 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_kv_append(
         server_task task(SERVER_TASK_TYPE_SLOT_KV_APPEND);
         task.id = rd.get_new_id();
         task.slot_action.id_slot = id_slot;
-        task.slot_action.tokens = body.at("tokens").get<std::vector<llama_token>>();
+        if (media_form) {
+            task.slot_action.prompt = body.at("prompt").get<std::string>();
+            if (task.slot_action.prompt.size() > 8 * 1024 * 1024) {
+                res->error(format_error_response("prompt is too large", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            for (const auto & entry : body.at("multimodal_data")) {
+                task.slot_action.multimodal_data.push_back(base64_decode(entry.get<std::string>()));
+            }
+        } else {
+            task.slot_action.tokens = body.at("tokens").get<std::vector<llama_token>>();
+        }
         task.slot_action.bootstrap_prefill = bootstrap_prefill;
         task.slot_action.continue_generation = continue_generation;
         task.slot_action.parser_prefix = body.value("parser_prefix", "");
@@ -6310,6 +7095,178 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_kv_append(
     }
 
     GGML_ASSERT(dynamic_cast<server_task_result_slot_kv_append*>(result.get()) != nullptr);
+    res->ok(result->to_json());
+    return res;
+}
+
+std::unique_ptr<server_res_generator> server_routes::handle_slots_image_geometry(
+        const server_http_req & req, int id_slot) {
+    auto res = create_response();
+    if (ctx_server.mctx == nullptr) {
+        res->error(format_error_response("image-geometry requires a server configured with --mmproj", ERROR_TYPE_NOT_SUPPORTED));
+        return res;
+    }
+    const json body = json::parse(req.body);
+    const std::string data_b64 = json_value(body, "data_b64", std::string());
+    if (!is_valid_base64(data_b64)) {
+        res->error(format_error_response("\"data_b64\" must be a non-empty base64 string", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+    const raw_buffer data = base64_decode(data_b64);
+
+    // Read-only geometry probe (docs/managed-vision.md): placeholder bitmap path,
+    // no slot state, no revision, no KV. Deterministic for (model, bytes).
+    const auto wrapper = mtmd_helper_bitmap_init_from_buf(ctx_server.mctx, data.data(), data.size(), /*placeholder=*/true, ctx_server.init_opt);
+    mtmd::bitmap bitmap(wrapper.bitmap);
+    if (bitmap.ptr == nullptr) {
+        res->error(format_error_response("failed to load image from \"data_b64\"", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+
+    server_tokens st;
+    try {
+        st = process_mtmd_prompt(ctx_server.mctx, get_media_marker(), { data }, ctx_server.init_opt, /*is_placeholder=*/true);
+    } catch (const std::exception & e) {
+        res->error(format_error_response(std::string("failed to resolve image geometry: ") + e.what(), ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+
+    const mtmd::input_chunk_ptr * chunk_ptr = nullptr;
+    if (st.size() > 0 && st[0] == LLAMA_TOKEN_NULL) {
+        chunk_ptr = &st.find_chunk(0);
+    } else {
+        chunk_ptr = st.find_next_media_chunk(0).first;
+    }
+    if (chunk_ptr == nullptr) {
+        res->error(format_error_response("no media chunk found in the geometry probe prompt", ERROR_TYPE_SERVER));
+        return res;
+    }
+    const auto & chunk = chunk_ptr->get();
+
+    const uint32_t grid_w = mtmd_input_chunk_get_nx(chunk);
+    const uint32_t grid_h = mtmd_input_chunk_get_ny(chunk);
+    res->ok(json {
+        { "sha256", sha256_hex(data.data(), data.size()) },
+        { "width", bitmap.nx() },
+        { "height", bitmap.ny() },
+        { "kv_cells", mtmd_input_chunk_get_n_tokens(chunk) },
+        { "n_positions", mtmd_input_chunk_get_n_pos(chunk) },
+        { "grid", json {
+            { "t", 1 },
+            { "h", grid_h },
+            { "w", grid_w },
+        } },
+        { "position_kind", (grid_w > 0 && grid_h > 0) ? "mrope_2d" : "linear" },
+    });
+    return res;
+}
+
+static bool parse_media_chunk_id(const std::string & str, uint64_t & id) {
+    static const std::string prefix = "fork-media:";
+    if (str.compare(0, prefix.size(), prefix) != 0) {
+        return false;
+    }
+    const std::string digits = str.substr(prefix.size());
+    if (digits.empty() || digits.find_first_not_of("0123456789") != std::string::npos) {
+        return false;
+    }
+    try {
+        id = std::stoull(digits);
+    } catch (const std::exception &) {
+        return false; // out of range
+    }
+    return true;
+}
+
+std::unique_ptr<server_res_generator> server_routes::handle_slots_media_retire(
+        const server_http_req & req, int id_slot) {
+    auto res = create_response();
+    const json body = json::parse(req.body);
+
+    // media_retire form (docs/managed-vision.md): acknowledged chunk handles plus
+    // the ledger ranges the router expects (validated before any mutation).
+    // An optional `tombstone` token list is installed at the earliest released
+    // interval when it fits.
+    if (!body.contains("media") || !body.at("media").is_array() || body.at("media").empty()) {
+        res->error(format_error_response("\"media\" must be a non-empty array", ERROR_TYPE_INVALID_REQUEST));
+        return res;
+    }
+
+    std::vector<server_task::slot_action::retired_media> retired;
+    retired.reserve(body.at("media").size());
+    for (const auto & entry : body.at("media")) {
+        if (!entry.is_object()) {
+            res->error(format_error_response("\"media\" entries must be objects", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        const std::string media_chunk_id_str = json_value(entry, "media_chunk_id", std::string());
+        uint64_t media_chunk_id;
+        if (!parse_media_chunk_id(media_chunk_id_str, media_chunk_id)) {
+            res->error(format_error_response("\"media_chunk_id\" must have the form \"fork-media:<digits>\"", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        auto get_range = [](const json & entry, const char * key) -> llama_pos {
+            if (!entry.contains(key) || !entry.at(key).is_number_integer()) {
+                return -1;
+            }
+            const int64_t value = entry.at(key).get<int64_t>();
+            return value >= 0 && value <= std::numeric_limits<llama_pos>::max() ? (llama_pos) value : -1;
+        };
+        const llama_pos token_start      = get_range(entry, "token_start");
+        const llama_pos token_end        = get_range(entry, "token_end");
+        const llama_pos position_start   = get_range(entry, "position_start");
+        const llama_pos position_end     = get_range(entry, "position_end");
+        if (token_start < 0 || token_end <= token_start ||
+                position_start < 0 || position_end <= position_start) {
+            res->error(format_error_response(
+                "\"token_start\"/\"token_end\"/\"position_start\"/\"position_end\" must be non-negative integers with end > start",
+                ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        retired.push_back({ media_chunk_id, token_start, token_end, position_start, position_end });
+    }
+
+    std::vector<llama_token> tombstone;
+    if (body.contains("tombstone")) {
+        if (!body.at("tombstone").is_array()) {
+            res->error(format_error_response("\"tombstone\" must be an array of token IDs", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        for (const auto & token : body.at("tombstone")) {
+            if (!token.is_number_integer() || token.get<int64_t>() < 0 ||
+                    (uint64_t) token.get<int64_t>() >= (uint64_t) std::numeric_limits<llama_token>::max()) {
+                res->error(format_error_response("\"tombstone\" entries must be non-negative token IDs", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+            tombstone.push_back(token.get<llama_token>());
+        }
+    }
+
+    auto & rd = res->rd;
+    {
+        server_task task(SERVER_TASK_TYPE_SLOT_MEDIA_RETIRE);
+        task.id = rd.get_new_id();
+        task.slot_action.id_slot = id_slot;
+        task.slot_action.media_retire = std::move(retired);
+        task.slot_action.tombstone    = std::move(tombstone);
+        if (!get_expected_revision(body, task.slot_action.expected_revision)) {
+            res->error(format_error_response("expected_revision must be a non-negative integer", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        rd.post_task(std::move(task));
+    }
+
+    auto result = rd.next(req.should_stop);
+    if (!result) {
+        GGML_ASSERT(req.should_stop());
+        return res;
+    }
+    if (result->is_error()) {
+        res->error(result->to_json());
+        return res;
+    }
+
+    GGML_ASSERT(dynamic_cast<server_task_result_slot_media_retire*>(result.get()) != nullptr);
     res->ok(result->to_json());
     return res;
 }
@@ -6447,6 +7404,12 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_managed_native
         server_task task(SERVER_TASK_TYPE_SLOT_MANAGED_NATIVE_COMPLETION);
         task.id = rd.get_new_id();
         task.slot_action.id_slot = id_slot;
+        task.slot_action.rolling_headroom = body.value("rolling_headroom", 0);
+        task.slot_action.rolling_context_limit = body.value("rolling_context_limit", 0);
+        if (task.slot_action.rolling_headroom < 0 || task.slot_action.rolling_context_limit < 0 ||
+                (task.slot_action.rolling_headroom > 0 && (task.slot_action.rolling_headroom < 128 || !stream))) {
+            throw std::runtime_error("Rolling generation requires streaming and at least 128 headroom tokens");
+        }
         task.slot_action.tokens = body.at("tokens").get<std::vector<llama_token>>();
         task.slot_action.continue_generation = continue_generation;
         if (!get_expected_revision(body, task.slot_action.expected_revision)) {
@@ -6489,9 +7452,12 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_managed_native
     // Rename ordinary scheduler records for the managed-native endpoint.
     auto to_sse_record = [](server_task_result * result) {
         json output = result->to_json();
+        if (dynamic_cast<server_task_result_managed_pause *>(result) != nullptr) {
+            return "data: " + safe_json_to_str(output) + "\n\n";
+        }
         if (output.is_null()) {
             // The first partial is an HTTP-header flush marker.
-            return "data: " + safe_json_to_str(json {{ "type", "managed_native_begin" }}) + "\n\n";
+            return "data: " + safe_json_to_str(json {{ "type", "managed_native_begin" }, { "id_task", result->id }}) + "\n\n";
         }
         output["type"] = dynamic_cast<server_task_result_cmpl_final *>(result) != nullptr
             ? "managed_native_final" : "managed_native_delta";
@@ -6532,7 +7498,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_slots_managed_native
             }
             GGML_ASSERT(
                 dynamic_cast<server_task_result_cmpl_partial *>(result.get()) != nullptr ||
-                dynamic_cast<server_task_result_cmpl_final *>  (result.get()) != nullptr
+                dynamic_cast<server_task_result_cmpl_final *>  (result.get()) != nullptr ||
+                dynamic_cast<server_task_result_managed_pause *>(result.get()) != nullptr
             );
             output = to_sse_record(result.get());
             if (dynamic_cast<server_task_result_cmpl_final *>(result.get()) != nullptr) {

@@ -2,7 +2,7 @@
 
 ## Contract
 
-This experimental fork gives a router explicit ownership of one text-only `llama-server` slot. The router supplies exact target-model token IDs, absolute half-open ranges, and an optimistic concurrency revision. The server can:
+This experimental fork gives a router explicit ownership of a `llama-server` slot. Text operations use exact target-model token IDs, half-open ledger ranges, and an optimistic concurrency revision. Image operations additionally carry acknowledged media spans and causal positions. The server can:
 
 - prefill an empty managed slot without generation;
 - delete an interior attention-KV range without decoding the retained suffix;
@@ -13,9 +13,9 @@ This experimental fork gives a router explicit ownership of one text-only `llama
 
 This is not exact context rewriting. Qwen 3.6 and Qwen3.8-Flash-Next are hybrid attention/recurrent models. Attention cells are released, but retained recurrent state is restored after an interior replacement and can still contain influence from removed content. Use an authoritative full rebuild when exact deletion semantics matter.
 
-The API remains version 1 and is intentionally separate from OpenAI-compatible completion routes. It is currently tested only with Qwen 3.6 27B. The current llama.cpp base also supports Qwen3.8-Flash-Next and DFlash2, but this fork has no recorded managed-KV validation for that target or draft. MTP is not supported after an interior edit. DSpark is present in upstream llama.cpp but is not enabled or validated for this managed path.
+The API remains version 1 and is intentionally separate from OpenAI-compatible completion routes. The current Spomin deployment uses Qwen3.8-27B and DFlash2 with coordinated target/draft editing and compaction. Its recorded live integration gate continued draft generation after closing 236 holes; see [source and validation](spomin-runtime-sync.md). MTP continuation after an interior edit is not supported. DSpark shares the implemented dual-edit path but needs its own model-specific validation.
 
-Managed operations reject servers configured with an `mmproj`, including text-only slots on such a server. Managed position holes use `LLAMA_TOKEN_NULL`; rejecting `mmproj` avoids confusing those holes with multimodal placeholders.
+Managed slots can carry images when the loaded runtime advertises the required vision capabilities. Media spans distinguish placeholder cells from released holes and track token-cell ranges separately from causal positions. See [managed vision](managed-vision.md); text edits cannot overlap an image span.
 
 ## Slot state machine
 
@@ -47,8 +47,8 @@ The managed capability object is returned by `GET /props`. Important discovery f
   "supports_context_shift": false,
   "supports_slot_save": false,
   "native_completion": true,
-  "qwen_attention_only_dflash_dual_edit": false,
-  "qwen_attention_only_dflash_dual_compact": false,
+  "qwen_attention_only_dflash_dual_edit": true,
+  "qwen_attention_only_dflash_dual_compact": true,
   "qwen_compact_positions": true
 }
 ```
@@ -84,7 +84,7 @@ POST /slots/0?action=kv_edit
 
 Empty replacement arrays delete ranges without prefill. Non-empty replacement arrays decode only the supplied marker or summary at the old range start. Later cached positions remain unchanged and are not re-prefilled. Unused positions become logical holes and their attention cells are available for reuse.
 
-After a router finishes a batch of non-compacting edits, it may close all resulting holes in one request by submitting those empty ranges again with `compact_positions: true`. Empty compacting ranges must already contain only released `LLAMA_TOKEN_NULL` positions in the managed prompt ledger. The server applies their cumulative position deltas to the retained target cache and compacts its position-aligned prompt ledger without decoding the retained suffix. The managed text-only path permits Qwen's M-RoPE cache because all rotary axes advance together for text, while the ordinary multimodal shift gate remains disabled. Attention-only surgery does not edit or compact the DFlash companion cache. With DFlash or DFlash2, keep positions uncompacted if draft continuation is required; a compacting edit invalidates the draft state. Other model-backed draft caches are invalidated. This remains KV surgery: retained values and recurrent representations are not recomputed.
+After a router finishes a batch of non-compacting edits, it may close all resulting holes in one request by submitting those empty ranges again with `compact_positions: true`. Empty compacting ranges must already contain only released `LLAMA_TOKEN_NULL` positions in the managed prompt ledger. The server applies their cumulative position deltas to the retained target cache and compacts its position-aligned prompt ledger without decoding the retained suffix. The managed text-only path permits Qwen's M-RoPE cache because all rotary axes advance together for text, while the ordinary multimodal shift gate remains disabled. The coherent DFlash/DFlash2 companion cache receives the corresponding removals, replacement features, and cumulative position shifts. Successful dual compaction preserves draft continuation. Check the advertised dual-compaction capability and the acknowledged draft coherence; an already incoherent draft is not repaired by this operation. Other model-backed draft caches are invalidated. This remains KV surgery: retained values and recurrent representations are not recomputed.
 
 ### Append without generation
 
@@ -141,7 +141,7 @@ Fork-only low-level operations are kept out of the stable public `llama.h` ABI:
 
 For attention-only Qwen replacement, the server snapshots the partial recurrent state, decodes replacement tokens into the released attention positions, then restores recurrent state. This deliberately avoids recomputing the retained suffix, but it is the source of the approximation boundary.
 
-DFlash and DFlash2 use the same speculative draft path. For ordinary dual edits, the draft cache can receive the corresponding injection. For the experimental attention-only Qwen path, the target cache is edited while the draft cache is retained, so the server does not claim that both caches contain identical edited ranges. M-RoPE positions are expanded locally for DFlash injection batches. A compacting attention-only edit clears the draft state; a non-compacting edit may continue with the retained draft state under target verification.
+DFlash and DFlash2 use the shared block-draft path. Explicit nonsequential processing injects replacement target features into the supported draft cache. Hole compaction shifts both caches, and the managed acknowledgement retains draft coherence only after successful coordinated operations. The runtime also carries DFlash2 tensor-split selector and position fixes. Unsupported target-only edits invalidate the draft; supported dual compaction does not.
 
 ## Build and test
 
@@ -187,7 +187,7 @@ On 2026-08-02, the hardened working tree passed the focused six-test CUDA server
 
 The target was 29,047,084,160 bytes with SHA-256 `88a2cd21a43cac266c74033f426d2929738960f139405758c11202336f916707`. DFlash was 1,849,481,312 bytes with SHA-256 `82545cd07d06cceaeb12feaa6ca76494214c872f83f71282bc6c009de61f30db`. These results establish implementation behavior, not semantic equivalence to a full rebuild.
 
-No Qwen3.8-Flash-Next or DFlash2 managed-KV validation result is claimed until a matching real-model run is recorded.
+The current Qwen3.8-27B/DFlash2 integration record is documented in [runtime synchronization](spomin-runtime-sync.md). The historical Qwen 3.6 numbers above are retained with their original model labels.
 
 ## Carrying the fork forward
 

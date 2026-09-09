@@ -2294,6 +2294,20 @@ llama_pos mtmd_input_chunk_get_n_pos(const mtmd_input_chunk * chunk) {
     }
 }
 
+uint32_t mtmd_input_chunk_get_nx(const mtmd_input_chunk * chunk) {
+    if (chunk->type == MTMD_INPUT_CHUNK_TYPE_IMAGE && chunk->tokens_image) {
+        return chunk->tokens_image->nx;
+    }
+    return 0;
+}
+
+uint32_t mtmd_input_chunk_get_ny(const mtmd_input_chunk * chunk) {
+    if (chunk->type == MTMD_INPUT_CHUNK_TYPE_IMAGE && chunk->tokens_image) {
+        return chunk->tokens_image->ny;
+    }
+    return 0;
+}
+
 const char * mtmd_input_chunk_get_id(const mtmd_input_chunk * chunk) {
     if (chunk->type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
         return chunk->tokens_image->id.c_str();

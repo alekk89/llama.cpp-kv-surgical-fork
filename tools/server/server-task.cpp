@@ -1675,6 +1675,8 @@ json server_task_result_slot_erase::to_json() {
 
 json server_task_result_slot_kv_edit::to_json() {
     return json {
+        { "media", media },
+        { "study_diagnostics", study_diagnostics },
         { "id_slot",         id_slot },
         { "n_removed",       n_removed },
         { "n_inserted",      n_inserted },
@@ -1692,7 +1694,7 @@ json server_task_result_slot_kv_edit::to_json() {
 }
 
 json server_task_result_slot_kv_append::to_json() {
-    return json {
+    json res = json {
         { "id_slot",       id_slot },
         { "n_appended",    n_appended },
         { "pos_start",     pos_start },
@@ -1703,6 +1705,32 @@ json server_task_result_slot_kv_append::to_json() {
         { "managed_draft_coherent", managed_draft_coherent },
         { "managed_requires_rebuild", managed_requires_rebuild },
     };
+    if (!media.empty()) {
+        res["media"]  = media;
+        res["tokens"] = tokens;
+    }
+    return res;
+}
+
+json server_task_result_slot_media_retire::to_json() {
+    json res = json {
+        { "id_slot",       id_slot },
+        { "removed_kv_cells", removed_kv_cells },
+        { "removed_positions", removed_positions },
+        { "shifted_text_cells", shifted_text_cells },
+        { "positions_compacted", positions_compacted },
+        { "tombstone_fits", tombstone_fits },
+        { "managed_revision", managed_revision },
+        { "managed_append_only", managed_append_only },
+        { "managed_draft_coherent", managed_draft_coherent },
+        { "managed_requires_rebuild", managed_requires_rebuild },
+        { "media", media },
+    };
+    if (tombstone_fits) {
+        res["tombstone_token_start"]    = tombstone_token_start;
+        res["tombstone_position_start"] = tombstone_position_start;
+    }
+    return res;
 }
 
 json server_task_result_slot_managed_generate::to_json() {

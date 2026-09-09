@@ -3,6 +3,8 @@
 #include "llama.h"
 #include "common.h"
 
+#include <algorithm>
+
 struct common_speculative;
 
 // comma separated list the provided types
@@ -46,6 +48,20 @@ struct common_speculative_output_limits {
 common_speculative_output_limits common_speculative_get_output_limits(
         int32_t n_batch, int32_t n_parallel, int32_t n_draft);
 
+// true when any enabled type is a block draft (DFlash/DSpark)
+inline bool common_speculative_is_block_draft(const std::vector<common_speculative_type> & types) {
+    return std::any_of(types.begin(), types.end(), [](common_speculative_type t) {
+        return t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+    });
+}
+
+// max draft-context ubatch for block drafts (DFlash/DSpark): their largest decode batch is
+// one noise block per sequence (n_max + 1 tokens), but the target-feature prefill (encoder +
+// KV injection) is chunked by the same ubatch, so keep a floor to avoid launch-bound chunks
+inline uint32_t common_speculative_block_draft_n_ubatch(uint32_t n_parallel, int32_t n_max) {
+    return std::max<uint32_t>(n_parallel * (uint32_t) std::max(1, n_max + 1), 64);
+}
+
 common_speculative * common_speculative_init(common_params_speculative & params, uint32_t n_seq);
 
 void common_speculative_free(common_speculative * spec);
@@ -77,7 +93,7 @@ common_speculative_draft_params & common_speculative_get_draft_params(common_spe
 void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, const llama_tokens & prompt);
 
 // process the batch and update the internal state of the speculative context
-bool common_speculative_process(common_speculative * spec, const llama_batch & batch);
+bool common_speculative_process(common_speculative * spec, const llama_batch & batch, bool allow_nonsequential = false);
 
 // generate drafts for the sequences specified with `common_speculative_get_draft_params`
 void common_speculative_draft(common_speculative * spec);

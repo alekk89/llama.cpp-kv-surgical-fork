@@ -172,6 +172,8 @@ private:
     std::unique_ptr<server_res_generator> handle_slots_surgery(const server_http_req & req, int id_slot);
     std::unique_ptr<server_res_generator> handle_slots_kv_append(
             const server_http_req & req, int id_slot, bool bootstrap_prefill = false);
+    std::unique_ptr<server_res_generator> handle_slots_image_geometry(const server_http_req & req, int id_slot);
+    std::unique_ptr<server_res_generator> handle_slots_media_retire(const server_http_req & req, int id_slot);
     std::unique_ptr<server_res_generator> handle_slots_managed_generate(const server_http_req & req, int id_slot);
     std::unique_ptr<server_res_generator> handle_slots_managed_native_completion(const server_http_req & req, int id_slot);
     std::unique_ptr<server_res_generator> handle_embeddings_impl(const server_http_req & req, task_response_type res_type);

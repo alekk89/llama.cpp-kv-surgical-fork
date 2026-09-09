@@ -1,7 +1,7 @@
 # llama.cpp KV surgery fork
 
 > [!WARNING]
-> This is an experimental research fork. It is not production-ready. The current base includes upstream support for Qwen3.8-Flash-Next and DFlash2, but the managed KV-surgery validation recorded here is still limited to Qwen 3.6 27B.
+> This experimental fork provides the managed KV runtime used by Spomin with Qwen3.8-27B and DFlash2. It supports coordinated target/draft edits and position compaction. See the [runtime synchronization record](docs/spomin-runtime-sync.md) for source provenance and verification.
 
 This repository is a focused fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp). See the upstream project for general llama.cpp documentation and normal OpenAI-compatible server usage.
 
@@ -9,7 +9,7 @@ This repository is a focused fork of [ggml-org/llama.cpp](https://github.com/ggm
 
 **In simple terms:** A router can delete an old chunk or replace a large old chunk with a short summary, reclaim the removed attention KV-cache cells, and keep generating without re-prefilling the retained suffix.
 
-**Technically:** The fork adds revision-checked, token-only managed-slot endpoints to `llama-server` for in-place KV range edits, appends, and continuation. Retained token positions do not move. Replacement or summary token IDs are the only tokens decoded during an edit; the retained suffix stays frozen, while later tail tokens can reuse the released attention-KV capacity.
+**Technically:** The fork adds revision-checked, token-only managed-slot endpoints to `llama-server` for in-place KV range edits, appends, and continuation. Non-compacting replacements preserve retained positions; a separate hole-compaction operation shifts target and supported draft positions together. Replacement or summary token IDs are the only tokens decoded during an edit; the retained suffix stays frozen, while later tail tokens can reuse the released attention-KV capacity.
 
 One initial cache fill is still required. "No re-prefill" means an edit does not decode the already-cached suffix again.
 
@@ -20,24 +20,24 @@ One initial cache fill is still required. "No re-prefill" means an edit does not
 | Component | Status |
 | --- | --- |
 | Qwen 3.6 27B | Managed KV surgery has been validated with this target |
-| Qwen3.8-Flash-Next | Supported by the current llama.cpp base; managed KV surgery is not yet validated here |
+| Qwen3.8-27B | Current Spomin target; live integration covered replacement, compaction, append, and draft generation |
 | DFlash | Supported by the current base; the original managed-DFlash validation used Qwen 3.6 27B |
-| DFlash2 | Supported by the current base. During experimental attention-only surgery, the target cache is edited while the companion draft cache is retained; this path is not yet separately validated |
-| DSpark | Included by the upstream base, but not currently enabled or validated for managed KV surgery |
+| DFlash2 | Coordinated target/draft range edits and hole compaction preserve coherent draft continuation; tensor-split selector support included |
+| DSpark | Shares the implemented dual-edit/compaction path; separate model-specific validation is required |
 | MTP | Not supported after an interior KV edit |
 
 On hybrid Qwen models, recurrent state is preserved rather than recomputed. Interior edits are therefore approximate, and removed content may still influence later output.
 
-A purpose-built router must own the slot, exact token IDs, absolute ranges, managed revision, and all later appends. The Spomin router that implements this lifecycle is still in development and will be added here soon. Until then, this experimental managed-slot API remains intentionally separate from ordinary OpenAI-compatible completion requests.
+A purpose-built router must own the slot, exact token IDs, absolute ranges, managed revision, and all later appends. The Spomin router implements this lifecycle. Its harness must disable automatic and manual compaction and preserve one session identity. This experimental managed-slot API remains intentionally separate from ordinary OpenAI-compatible completion requests.
 
-Managed KV operations are text-only and reject any server configured with an `mmproj`. This avoids ambiguity between managed cache holes and multimodal placeholder tokens.
+Managed text and image operations use separate token-cell and causal-position coordinates. Vision requires a matching projector and advertised capabilities; see [managed vision](docs/managed-vision.md). Never cut a generic text edit through an image span.
 
 Managed slots also disable ordinary context shifting. Generation stops at the live cache limit instead of compacting router-owned absolute positions; the router must delete, summarize, or rebuild to create capacity.
 
 ## Requirements
 
 - CMake and a C++ compiler supported by upstream llama.cpp.
-- A supported target GGUF model. Qwen 3.6 27B is the validated managed-surgery target; Qwen3.8-Flash-Next is supported by the current base but is not yet validated for managed surgery here.
+- A supported target GGUF model. The current Spomin deployment uses Qwen3.8-27B Q8_0.
 - Optionally, a matching DFlash or DFlash2 GGUF sidecar.
 - A writable slot-save directory. Managed slot actions are disabled without `--slot-save-path`.
 - Enough CPU RAM or VRAM for the selected model and KV-cache configuration.
@@ -50,7 +50,7 @@ For Windows CUDA builds, install Visual Studio 2022 Build Tools with the C++ wor
 
 ```sh
 git clone --branch experimental/kv-surgery-dflash https://github.com/alekk89/llama.cpp-kv-surgical-fork.git
-cd llama.cpp
+cd llama.cpp-kv-surgical-fork
 cmake -S . -B build -DGGML_CUDA=ON -DLLAMA_BUILD_SERVER=ON
 cmake --build build --config Release --target llama-server -j 8
 ```
@@ -69,8 +69,8 @@ Create a writable slot directory and start one fixed slot. The examples use a 12
 ```powershell
 New-Item -ItemType Directory -Force .\tmp\slots | Out-Null
 .\build\bin\Release\llama-server.exe `
-  -m C:\models\Qwen3.6-27B-Q8_0.gguf `
-  -md C:\models\Qwen3.6-27B-DFlash-Q8_0.gguf `
+  -m C:\models\Qwen3.8-27B-Q8_0.gguf `
+  -md C:\models\Qwen3.8-27B-DFlash2-Q4_K_M.gguf `
   --spec-type draft-dflash `
   --spec-draft-n-max 15 `
   --ctx-size 12288 `
@@ -87,7 +87,7 @@ New-Item -ItemType Directory -Force .\tmp\slots | Out-Null
 ```sh
 mkdir -p ./tmp/slots
 ./build/bin/llama-server \
-  -m /models/Qwen3.6-27B-Q8_0.gguf \
+  -m /models/Qwen3.8-27B-Q8_0.gguf \
   --ctx-size 12288 \
   --parallel 1 \
   --slot-save-path ./tmp/slots/ \
@@ -175,7 +175,7 @@ You may instead bootstrap an empty slot with `managed_native_completion` when yo
 
 ### 3. Delete a cached chunk
 
-Delete a range by supplying an empty replacement token array. For Qwen, enable experimental attention-only mode and keep position compaction disabled.
+Delete a range by supplying an empty replacement token array. For Qwen, enable experimental attention-only mode. The examples leave holes first; a separate compaction closes them after replacement.
 
 ```sh
 curl -sS -X POST "$BASE/slots/0?action=kv_edit" \
@@ -297,7 +297,7 @@ The erase response returns the new `managed_revision`. Rebuild from the router's
 - Commit router state only after receiving a successful response and its new revision.
 - After any server-side mutation failure, inspect `/slots`. If `managed_requires_rebuild` is true, erase and rebuild from authoritative router state before sending another managed action.
 - Keep exact tokenizer IDs and absolute ranges. Do not reconstruct edited ranges from decoded text.
-- Keep `compact_positions: false` for hybrid Qwen targets, including Qwen 3.6 and Qwen3.8-Flash-Next, when using the experimental attention-only path.
+- For draft-preserving position compaction, require `qwen_compact_positions` and `qwen_attention_only_dflash_dual_compact`, then check `managed_draft_coherent` in the acknowledgement.
 - After surgery, do not send an ordinary `/completion` request against the slot.
 - Do not use normal prompt-cache matching to continue an edited slot.
 - Use a router rebuild when exact deletion semantics are required.
@@ -339,7 +339,7 @@ The validated capacity run reduced 9,980 prefetched tokens to 5,301 live attenti
 
 ## Safety boundary
 
-This fork performs approximate cache surgery, not exact context rewriting. Attention-KV cells are removed, but Qwen's retained recurrent state can still contain influence from deleted material. Positions are deliberately not compacted.
+This fork performs approximate cache surgery, not exact context rewriting. Attention-KV cells are removed, but Qwen's retained recurrent state can still contain influence from deleted material. Position compaction changes rotary coordinates while preserving retained values and recurrent tensors.
 
 Use proxy/rebuild behavior for exact semantics, decompression, recovery, or any model and draft combination that has not been separately validated.
 

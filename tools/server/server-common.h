@@ -37,6 +37,12 @@ using json = common_json;
 
 using raw_buffer = std::vector<uint8_t>;
 
+// decode a base64-encoded string (used for multimodal_data and media URLs)
+raw_buffer base64_decode(const std::string & encoded_string);
+
+// SHA-256 of the given bytes, lowercase hex; used in managed-vision acknowledgements
+std::string sha256_hex(const void * data, size_t len);
+
 template <typename T>
 static T json_value(const json & body, const std::string & key, const T & default_value) {
     // Fallback null to default value

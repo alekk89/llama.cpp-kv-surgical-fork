@@ -230,6 +230,9 @@ MTMD_API size_t                     mtmd_input_chunk_get_n_tokens    (const mtmd
 MTMD_API const char *               mtmd_input_chunk_get_id          (const mtmd_input_chunk * chunk);
 // number of temporal positions (equals to max(t,h,w) for M-RoPE; equals to n_tokens otherwise)
 MTMD_API llama_pos                  mtmd_input_chunk_get_n_pos       (const mtmd_input_chunk * chunk);
+// image grid dimensions (tokens in x/y direction); 0 for non-image chunks
+MTMD_API uint32_t                   mtmd_input_chunk_get_nx          (const mtmd_input_chunk * chunk);
+MTMD_API uint32_t                   mtmd_input_chunk_get_ny          (const mtmd_input_chunk * chunk);
 
 // in case you want to use custom logic to handle the chunk (i.e. KV cache management)
 // you can move the chunk ownership to your own code by copying it

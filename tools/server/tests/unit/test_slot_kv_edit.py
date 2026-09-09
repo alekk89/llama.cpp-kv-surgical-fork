@@ -154,14 +154,27 @@ def test_managed_slot_capabilities():
         "legacy_generate_deprecated": True,
         "bootstrap_generate": True,
         "native_completion": True,
+        "native_rolling_generation": True,
         "native_bootstrap": True,
         "native_prefill_recovery": True,
         "native_continuation": True,
         "dual_kv_edit": True,
-        "qwen_attention_only_dflash_dual_edit": False,
-        "qwen_attention_only_dflash_dual_compact": False,
+        "qwen_attention_only_dflash_dual_edit": True,
+        "qwen_attention_only_dflash_dual_compact": True,
+        "qwen_attention_only_dspark_dual_edit": True,
+        "qwen_attention_only_dspark_dual_compact": True,
         "qwen_attention_only": True,
         "qwen_compact_positions": True,
+        "vision": False,
+        "vision_geometry": False,
+        "vision_span_prefill": False,
+        "vision_span_append": False,
+        "vision_span_retire": False,
+        "vision_retire_attention_only": False,
+        "vision_recurrent_replay": False,
+        "mrope_compaction": False,
+        "vision_text_edit": False,
+        "video": False,
     }
 
 
@@ -255,6 +268,9 @@ def test_managed_native_lifecycle_and_stream_contract():
     assert final["managed_revision"] == 3
     assert final["managed_append_only"] is True
     assert final["managed_requires_rebuild"] is False
+    streamed_tokens = [token for event in events if event["type"] == "managed_native_delta" for token in event["tokens"]]
+    assert final["tokens"] == streamed_tokens
+    assert len(final["tokens"]) == final["tokens_predicted"]
 
     res = server.make_request("POST", "/slots/1?action=managed_native_completion", data={
         "expected_revision": 3,
