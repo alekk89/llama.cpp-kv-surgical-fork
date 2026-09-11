@@ -1,4 +1,227 @@
-# KV surgery technical guide
+# KV surgery setup and technical guide
+
+## Setup
+
+This fork is the managed runtime used by Spomin. Build and run `llama-server`, then let the router own one fixed managed slot. The documented integration target is Qwen3.8-27B with a matching DFlash2 sidecar.
+
+### Requirements
+
+- CMake and a C++ compiler supported by upstream `llama.cpp`.
+- A Qwen3.8-27B GGUF target model for the current integration path.
+- Optionally, the matching DFlash2 GGUF sidecar.
+- A writable slot-save directory. Managed slots require `--slot-save-path`.
+- Enough CPU RAM or VRAM for the model, draft model, and KV-cache configuration.
+
+CUDA is optional. Replace `GGML_CUDA` with the backend appropriate for your machine. On Windows, use Visual Studio 2022 Build Tools with C++, CMake, Git, and a compatible CUDA toolkit. On Linux, use Git, CMake, Python 3, and the compiler/backend toolchain for your system.
+
+### Build
+
+```sh
+git clone --branch experimental/kv-surgery-dflash https://github.com/alekk89/llama.cpp-kv-surgical-fork.git
+cd llama.cpp-kv-surgical-fork
+cmake -S . -B build -DGGML_CUDA=ON -DLLAMA_BUILD_SERVER=ON
+cmake --build build --config Release --target llama-server -j 8
+```
+
+The normal binary locations are `build\\bin\\Release\\llama-server.exe` on Windows multi-config builds and `build/bin/llama-server` on Linux or macOS single-config builds.
+
+### Start the server
+
+Create a writable slot directory and start one fixed slot. Adjust model filenames, cache types, GPU offload, context size, and draft size for your machine.
+
+Windows PowerShell with DFlash2:
+
+```powershell
+New-Item -ItemType Directory -Force .\\tmp\\slots | Out-Null
+.\\build\\bin\\Release\\llama-server.exe `
+  -m C:\\models\\Qwen3.8-27B-Q8_0.gguf `
+  -md C:\\models\\Qwen3.8-27B-DFlash2-Q4_K_M.gguf `
+  --spec-type draft-dflash `
+  --spec-draft-n-max 15 `
+  --ctx-size 12288 `
+  --parallel 1 `
+  --slot-save-path .\\tmp\\slots `
+  --slots `
+  --no-webui `
+  -fa on `
+  -ngl 999
+```
+
+Linux or macOS without a draft sidecar:
+
+```sh
+mkdir -p ./tmp/slots
+./build/bin/llama-server \
+  -m /models/Qwen3.8-27B-Q8_0.gguf \
+  --ctx-size 12288 \
+  --parallel 1 \
+  --slot-save-path ./tmp/slots/ \
+  --slots \
+  --no-webui \
+  -fa on \
+  -ngl 999
+```
+
+The DFlash2 selector is read from the draft GGUF metadata. The draft size is clamped to the sidecar's trained block size. Keep the server bound to `127.0.0.1` unless authentication and a trusted network boundary are configured.
+
+## Use
+
+The managed API is separate from ordinary OpenAI-compatible completion requests. A router must own the exact token IDs, absolute ranges, managed revision, slot ID, and later appends.
+
+### Discover capabilities
+
+The server defaults to `http://127.0.0.1:8080`:
+
+```sh
+curl -sS http://127.0.0.1:8080/props
+curl -sS http://127.0.0.1:8080/slots
+```
+
+In Windows PowerShell, use `curl.exe` if `curl` resolves to `Invoke-WebRequest`. `/props` should advertise `managed_slot` with `api_version: 1`, `edit: true`, `append: true`, `native_completion: true`, and the required DFlash2 dual-edit and compaction capabilities. Each slot reports `managed_revision`, `managed_draft_coherent`, and `managed_requires_rebuild`.
+
+### Endpoint summary
+
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /props` | Discover managed-slot capabilities and server defaults |
+| `GET /slots` | Inspect slot state and managed revision |
+| `POST /tokenize` | Convert router text to exact target-model token IDs |
+| `POST /detokenize` | Convert token IDs back to text for diagnostics |
+| `POST /slots/{id}?action=managed_native_prefill` | Fill an empty slot without generation |
+| `POST /slots/{id}?action=kv_edit` | Delete, replace, or compact cached ranges |
+| `POST /slots/{id}?action=kv_append` | Decode exact tokens at the logical tail |
+| `POST /slots/{id}?action=managed_native_completion` | Append and generate through the normal scheduler |
+| `POST /slots/{id}?action=cancel` | Cancel a managed generation task for a slot |
+| `POST /slots/{id}?action=erase` | Clear a slot before an authoritative rebuild |
+
+For image-aware slots, use the separate [managed vision guide](managed-vision.md). Do not cut a generic text edit through an image span.
+
+### Managed workflow
+
+Set a base URL for the examples:
+
+```sh
+BASE=http://127.0.0.1:8080
+```
+
+In PowerShell, use `$BASE = "http://127.0.0.1:8080"` and replace `curl` with `curl.exe`.
+
+#### 1. Tokenize the complete prompt
+
+Tokenize the full initial router prompt once and persist the returned IDs. Normally, set `add_special: true` only for this initial prompt.
+
+```sh
+curl -sS -X POST "$BASE/tokenize" \
+  -H "Content-Type: application/json" \
+  -d '{"content":"Your complete initial router prompt","add_special":true,"parse_special":true}'
+```
+
+Record each removable object's absolute `[start_pos, end_pos)` range. `start_pos` is inclusive and `end_pos` is exclusive.
+
+#### 2. Prefill and claim the slot
+
+Replace the illustrative IDs with the complete array returned by `/tokenize`:
+
+```sh
+curl -sS -X POST "$BASE/slots/0?action=managed_native_prefill" \
+  -H "Content-Type: application/json" \
+  -d '{"expected_revision":0,"tokens":[151644,8948,198,2610]}'
+```
+
+Persist the returned `managed_revision`. Every successful managed mutation increments it. `managed_native_completion` can bootstrap an empty slot when initial generation is also needed.
+
+#### 3. Replace or delete a range
+
+Delete with an empty replacement, or install a shorter marker or summary. For hybrid Qwen targets, use `experimental_attention_only: true`.
+
+```sh
+curl -sS -X POST "$BASE/slots/0?action=kv_edit" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "expected_revision":1,
+    "experimental_attention_only":true,
+    "compact_positions":false,
+    "edits":[
+      {"start_pos":1176,"end_pos":1243,"tokens":[]},
+      {"start_pos":1650,"end_pos":1706,"tokens":[101,202,303]}
+    ]
+  }'
+```
+
+Edits must be ordered, non-overlapping, inside the cached range, and use valid target-model IDs. A replacement cannot be longer than the removed range. The retained suffix stays at its original positions and is not prefetched again. Empty positions become reusable attention-KV holes.
+
+#### 4. Compact released holes
+
+When `GET /props` advertises the DFlash2 dual-compaction capabilities and the slot reports coherent draft state, close released holes in a later request. The ranges submitted for compaction must contain only released `LLAMA_TOKEN_NULL` positions.
+
+```sh
+curl -sS -X POST "$BASE/slots/0?action=kv_edit" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "expected_revision":2,
+    "experimental_attention_only":true,
+    "compact_positions":true,
+    "edits":[
+      {"start_pos":1176,"end_pos":1243,"tokens":[]}
+    ]
+  }'
+```
+
+Compaction shifts the target and supported DFlash2 draft positions together without decoding the retained suffix. Do not compact an incoherent slot; rebuild it first.
+
+#### 5. Append exact tokens
+
+Use `kv_append` when the router needs to add tokens without generating:
+
+```sh
+curl -sS -X POST "$BASE/slots/0?action=kv_append" \
+  -H "Content-Type: application/json" \
+  -d '{"expected_revision":3,"tokens":[606,707,808]}'
+```
+
+The response includes `pos_start`, `pos_end`, `n_appended`, and `token_probe`.
+
+#### 6. Continue generation
+
+Use `managed_native_completion` after a managed edit or append. It uses the normal scheduler and evaluates only the new tail.
+
+```sh
+curl -sS -X POST "$BASE/slots/0?action=managed_native_completion" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "expected_revision":4,
+    "tokens":[],
+    "n_predict":128,
+    "temperature":0.2,
+    "stream":false
+  }'
+```
+
+Set `stream: true` for `managed_native_begin`, `managed_native_delta`, and `managed_native_final` events followed by `data: [DONE]`. Send an empty token array with `continue_generation: true` to continue from the current logical tail.
+
+For rolling generation, set `rolling_headroom` and `rolling_context_limit` on a streaming request. The server emits a managed pause before the configured headroom is exhausted; the router can compact, append, or resume the same task without replaying the prompt.
+
+#### 7. Cancel a managed task
+
+Use the task ID returned by the managed generation stream:
+
+```sh
+curl -sS -X POST "$BASE/slots/0?action=cancel" \
+  -H "Content-Type: application/json" \
+  -d '{"expected_task_id":12}'
+```
+
+Cancellation is task-scoped. The response confirms that cancellation was requested; consume the generation stream to observe its final state.
+
+#### 8. Recover a slot
+
+If a mutation reports `managed_requires_rebuild: true`, stop using the slot, erase it, and rebuild it from the router's authoritative token ledger:
+
+```sh
+curl -sS -X POST "$BASE/slots/0?action=erase"
+```
+
+Revision mismatches and validation failures do not mutate the slot. Do not use ordinary `/completion`, normal prompt-cache matching, or managed slot save/restore as a substitute for the router rebuild.
 
 ## Contract
 
@@ -143,14 +366,7 @@ For attention-only Qwen replacement, the server snapshots the partial recurrent 
 
 DFlash and DFlash2 use the shared block-draft path. Explicit nonsequential processing injects replacement target features into the supported draft cache. Hole compaction shifts both caches, and the managed acknowledgement retains draft coherence only after successful coordinated operations. The runtime also carries DFlash2 tensor-split selector and position fixes. Unsupported target-only edits invalidate the draft; supported dual compaction does not.
 
-## Build and test
-
-Build the server:
-
-```powershell
-cmake -S . -B build -DGGML_CUDA=ON -DLLAMA_BUILD_SERVER=ON
-cmake --build build --config Release --target llama-server -j 8
-```
+## Validate the fork
 
 Run the focused regression:
 
